@@ -1,0 +1,3429 @@
+//+------------------------------------------------------------------+
+//|                  DynamicBasketTrader_BTCUSD_M5.mq5               |
+//|                            Copyright 2024, Your Name             |
+//|                                        Your Link                 |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2024, Your Name"
+#property link      "Your Link"
+#property version   "1.04" // Increment version for new structure
+#property description "EA for BTCUSD M5 focusing on Dynamic Hedging, DCA, and Basket Profit."
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\AccountInfo.mqh>
+#include <Trade\SymbolInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <ChartObjects\ChartObjectsTxtControls.mqh> // สำหรับ text label: เฉพาะ EA/Custom Indicator!
+//--- Input Parameters ---
+input group             "Risk Management"
+input double            InpLotSizeInitial        = 0.01;  // Initial Lot Size
+input double            InpRequiredMarginEquityRatio = 0.3;   // e.g., 0.3 = 30% Free Margin / Equity Ratio
+input double InpTargetProfit = 100.0; // ปิดทั้งหมดถ้ากำไรรวมถึง 100 ดอลลาร์
+input double InpTargetProfit_ = 5; // ปิดทั้งหมดถ้ากำไรรวมถึง 1
+input group             "Hedging Strategy"
+input bool              InpUseHedging            = true;  // Enable/Disable Hedging
+input double            InpHedgeLotMultiplier    = 2.0;   // Lot Multiplier for Hedge trades
+input double            InpHedgeTriggerPipsAgainst = 20.0; // Pips price moves against before HEDGE is considered
+// input group "Trailing Stop Parameters (For Basket)" // อาจจะต้องปรับชื่อ Group
+input bool   InpUseBasketTrailingStop    = true;  // Enable/Disable Trailing Stop for the Basket
+input double InpBasketProfitPipsToStartTrail = 50.0; // Pips กำไรของ Basket เพื่อเริ่ม Trailing Stop
+input double InpBasketTrailStepPips      = 20.0;  // Fixed Trailing Stop distance in Pips for the Basket
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+input double InpTrailDistance = 10000.0;        // จุด trailing SL (point)
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+input group             "Counter-Hedging (Order 3)"
+input bool              InpUseCounterHedge       = true;  // Enable/Disable Counter-Hedge
+
+input group             "DCA Strategy"
+input bool              InpUseDCA                = true;  // Enable/Disable DCA
+input double            InpDCALotMultiplier      = 1.5;   // Lot Multiplier for DCA steps
+input double            InpDCAStepPipsOrSignal   = 30.0;  // Pips step for DCA (if <=0, uses Signal-based)
+input int               InpMaxDCATrades          = 5;     // Max DCA trades per cycle
+
+input group             "Trade Exit & Targets"
+input double            InpMinBasketTargetProfitUSD = 0.1; // Minimum Basket Profit in USD to close all
+input int               InpSlippagePoints        = 10;    // Allowed Slippage in Points
+
+input group             "Magic Number & Comments"
+input ulong             InpMagicNumber           = 12345; // EA's Magic Number
+input string            InpCommentPrefix         = "DBT_"; // Order Comment Prefix
+
+input group             "Daily Bias & Reversal Signal Logic"
+input bool              InpEnableBiasLogic       = true;
+input int               InpD1EmaPeriod           = 200;   // Period for D1 EMA
+input int               InpM15RsiPeriod          = 14;    // Period for M15 RSI
+input double            InpM15RsiOvbLevel        = 75.0;  // M15 RSI Overbought Level
+input double            InpM15RsiOvsLevel        = 25.0;  // M15 RSI Oversold Level
+input int               InpM5SwingDepth          = 3;     // Depth for M5 swing point detection
+input int               InpM5SwingLookback       = 36;    // Lookback bars for M5 swings
+input double            InpM5BreakoutATRMult     = 0.2;   // ATR Multiplier for M5 breakout confirmation
+input int               InpM5AtrPeriod           = 14;    // Period for M5 ATR
+
+input group             "Initial M5 Entry Logic"
+input bool              InpEnableInitialEntryLogic = true;
+input int               InpM5EmaFastPeriod       = 9;     // M5 Fast EMA Period
+input int               InpM5EmaSlowPeriod       = 20;    // M5 Slow EMA Period (used with Fast EMA)
+input double            InpM5EngulfMinBodyRatio  = 0.8;   // Min body ratio for M5 Engulfing
+
+input group             "M5 Swing Detection Method"
+input bool              InpM5UseZigZagForSwings = true;
+input group             "M5 ZigZag Parameters (if UseZigZag is true)"
+input int               InpM5ZigZagDepth        = 12;
+input int               InpM5ZigZagDeviation    = 5;
+input int               InpM5ZigZagBackstep     = 3;
+input int            InpM5ZigZagScanBars     = 200;
+
+input group             "Multi-Timeframe EMA Bias Settings"
+input int               InpEMA_D1_Period    = 50;
+input ENUM_MA_METHOD    InpEMA_D1_Method    = MODE_EMA;
+input ENUM_APPLIED_PRICE InpEMA_D1_Price    = PRICE_CLOSE;
+
+input int               InpEMA_H4_Period    = 100;
+input ENUM_MA_METHOD    InpEMA_H4_Method    = MODE_EMA;
+input ENUM_APPLIED_PRICE InpEMA_H4_Price    = PRICE_CLOSE;
+
+input int               InpEMA_M30_Period   = 150;
+input ENUM_MA_METHOD    InpEMA_M30_Method   = MODE_EMA;
+input ENUM_APPLIED_PRICE InpEMA_M30_Price   = PRICE_CLOSE;
+
+input int               InpEMA_M5_Period    = 200; // EMA เส้นนี้บน M5 สำหรับ Bias Score
+input ENUM_MA_METHOD    InpEMA_M5_Method    = MODE_EMA;
+input ENUM_APPLIED_PRICE InpEMA_M5_Price    = PRICE_CLOSE;
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+input group             "Follow Trend Strategy (M15 BoS + M5 PA)"
+input bool              InpEnableFollowTrend      = true;
+input ENUM_TIMEFRAMES   InpBoSTimeframe           = PERIOD_M15;
+input int               InpBoSSwingDepth          = 3;     // Depth for BoS Swing detection on InpBoSTimeframe
+input int               InpBoSSwingLookback       = 60;    // Lookback for BoS Swing detection
+input double            InpBoS_ATR_Multiplier_FT  = 0.3;   // ATR Multiplier for BoS confirmation strength
+input double            InpBoS_Body_Ratio_FT      = 0.5;   // Min Body Ratio for BoS candle
+input int               InpPullbackMaxBars        = 5;     // Max M15 bars to wait for pullback after BoS
+input double            InpPullbackRetraceMaxATR  = 0.5;   // Max pullback retrace (ATR multiple) beyond breakout level
+input int               InpM15_ATR_Period_FT      = 14;    // ATR Period for M15 calculations
+input int               InpM15_EMA_Pullback       = 20;    // EMA Period on M15 for pullback reference
+
+//--- Global Variables ---
+CTrade          trade;
+CAccountInfo    account;
+CSymbolInfo     g_symbolInfo;
+CPositionInfo   position;
+int h_M15_ATR_FT = INVALID_HANDLE;
+int h_M15_EMA_Pullback = INVALID_HANDLE;
+bool   g_use_basket_trailing_stop;
+double g_basket_profit_pips_to_start_trail;
+double g_basket_trail_step_pips;
+// (Initialize ใน OnInit จาก Inputs)
+// EA Operation Parameters
+ulong           g_magic_number;
+string          g_comment_prefix;
+double          g_required_margin_equity_ratio;
+double          g_initial_lot_size;
+int             g_slippage_points;
+
+// Hedging Parameters
+bool            g_use_hedging;
+double          g_hedge_lot_multiplier;
+double          g_hedge_trigger_pips_against;
+bool            g_use_counter_hedge;
+
+// DCA Parameters
+bool            g_use_dca;
+double          g_dca_lot_multiplier;
+double          g_dca_step_pips_or_signal;
+int             g_max_dca_trades;
+
+// Exit Parameters
+double          g_min_basket_target_profit_usd;
+
+// Bias & Signal Logic Enablers
+bool            g_enable_bias_logic;
+bool            g_enable_initial_entry_logic;
+
+// Indicator Handles
+int             h_D1_EMA200 = INVALID_HANDLE;
+int             h_M15_RSI14 = INVALID_HANDLE;
+int             h_M5_EMA9   = INVALID_HANDLE;
+int             h_M5_EMA20  = INVALID_HANDLE;
+// int          h_M5_EMA50  = INVALID_HANDLE; // Not currently used in entry logic
+int             h_M5_ATR14  = INVALID_HANDLE;
+int             h_M5_ZigZag = INVALID_HANDLE;
+// Indicator Handles for Multi-Timeframe EMA Bias
+int h_EMA_D1_Bias  = INVALID_HANDLE;
+int h_EMA_H4_Bias  = INVALID_HANDLE;
+int h_EMA_M30_Bias = INVALID_HANDLE;
+int h_EMA_M5_Bias  = INVALID_HANDLE; // EMA บน M5 ที่ใช้สำหรับ Bias (ไม่ใช่ตัวเดียวกับที่ใช้ใน Entry)
+int h_M30_EMA_Bias  = INVALID_HANDLE;
+int h_M5_EMA_Bias  = INVALID_HANDLE;
+int h_H4_EMA_Bias = INVALID_HANDLE;
+// Enum for Daily Bias / Reversal Signal Status (CORRECTED AND COMPLETED)
+enum ENUM_BIAS_STATUS
+  {
+   BIAS_NEUTRAL,
+   BIAS_BULLISH_VERY_STRONG,
+   BIAS_BULLISH_STRONG,
+   BIAS_BULLISH_MODERATE,
+   BIAS_BULLISH_WEAK,
+   BIAS_BEARISH_VERY_STRONG,
+   BIAS_BEARISH_STRONG,
+   BIAS_BEARISH_MODERATE,
+   BIAS_BEARISH_WEAK,
+   BIAS_RANGING_CONFIRMED,         // For 2-2 scores or very conflicting signals
+   SIGNAL_REVERSAL_UP_M5,
+   SIGNAL_REVERSAL_DOWN_M5,
+   SIGNAL_REVERSAL_UP_M15,
+   SIGNAL_REVERSAL_DOWN_M15,
+   SIGNAL_OVB_M15,                 // Changed from H1
+   SIGNAL_OVS_M15,                 // Changed from H1
+   SIGNAL_CONTINUATION_BULLISH_M5,
+   SIGNAL_CONTINUATION_BEARISH_M5,
+   SIGNAL_OVB_H1,
+   SIGNAL_OVS_H1,
+   BIAS_D1_BULLISH_STRONG,
+   BIAS_D1_BULLISH_MODERATE,
+   BIAS_D1_BEARISH_STRONG,
+   BIAS_D1_BEARISH_MODERATE,
+   BIAS_D1_RANGING,
+  };
+ENUM_BIAS_STATUS g_current_bias_status = BIAS_NEUTRAL;
+enum ENUM_CYCLE_STATUS { CYCLE_EMPTY, CYCLE_INITIAL_TRADE_OPEN, CYCLE_HEDGED, CYCLE_COUNTER_HEDGED, CYCLE_IN_DCA };
+
+struct SwingPoint { datetime time; double price; bool isHigh; int shift; }; // For M5 Reversal
+
+struct TradeInCycle { ulong ticket; ENUM_ORDER_TYPE type; double open_price; double initial_lot; double current_lot; datetime open_time; };
+
+struct TradeCycle
+  {
+   bool              is_active;
+   ENUM_CYCLE_STATUS status;
+   string            id;
+   TradeInCycle      initial_trade;
+   TradeInCycle      hedge_trade;
+   ulong             counter_hedge_pending_ticket;
+   TradeInCycle      counter_hedge_filled_trade;
+   TradeInCycle      dca_trades[];
+   int               dca_count;
+   double            calculated_basket_target_price;
+   ENUM_ORDER_TYPE   current_basket_dominant_direction;
+   double            current_basket_dominant_lot;
+  };
+TradeCycle      g_current_trade_cycle;
+
+struct InitialTradeSignalDetails { bool isValid; ENUM_ORDER_TYPE orderType; double entryPriceSuggestion; double calculatedStopLoss; string signalDescription; };
+
+//+------------------------------------------------------------------+
+//| Helper function to determine the number of decimal places for lot step.|
+//+------------------------------------------------------------------+
+int GetLotStepDigits(double lotStep)
+  {
+   if(lotStep <= 0)
+      return 2;
+   if(lotStep >= 1.0)
+      return 0;
+   if(lotStep >= 0.1)
+      return 1;
+   double epsilon = 0.000000001;
+   if(MathAbs(lotStep - 0.01) < epsilon || lotStep > 0.001)
+      return 2;
+   if(MathAbs(lotStep - 0.001) < epsilon || lotStep > 0.0001)
+      return 3;
+   if(MathAbs(lotStep - 0.0001) < epsilon)
+      return 4;
+   return 2; // Default
+  }
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+//--- Initialize Global Variables from Inputs
+   g_magic_number                 = InpMagicNumber;
+   g_comment_prefix               = InpCommentPrefix;
+   g_required_margin_equity_ratio = InpRequiredMarginEquityRatio;
+   g_initial_lot_size             = InpLotSizeInitial;
+   g_slippage_points              = InpSlippagePoints;
+
+   g_use_hedging                  = InpUseHedging;
+   g_hedge_lot_multiplier         = InpHedgeLotMultiplier;
+   g_hedge_trigger_pips_against   = InpHedgeTriggerPipsAgainst;
+   g_use_counter_hedge            = InpUseCounterHedge;
+
+   g_use_dca                      = InpUseDCA;
+   g_dca_lot_multiplier           = InpDCALotMultiplier;
+   g_dca_step_pips_or_signal      = InpDCAStepPipsOrSignal;
+   g_max_dca_trades               = InpMaxDCATrades;
+
+   g_min_basket_target_profit_usd = InpMinBasketTargetProfitUSD;
+
+   g_enable_bias_logic            = InpEnableBiasLogic;
+   g_enable_initial_entry_logic   = InpEnableInitialEntryLogic;
+
+//--- Initialize Trade Object
+   trade.SetExpertMagicNumber(g_magic_number);
+   trade.SetDeviationInPoints(g_slippage_points);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+//--- Initialize Symbol and Account Info
+   if(!g_symbolInfo.Name(_Symbol) || !account.InfoInteger(ACCOUNT_LEVERAGE))
+     {
+      Print("Error initializing SymbolInfo or AccountInfo objects.");
+      return(INIT_FAILED);
+     }
+   if(g_enable_bias_logic) // หรือ InpEnableBiasLogic ถ้ายังไม่ได้ map เข้า global
+     {
+      h_EMA_D1_Bias = iMA(_Symbol, PERIOD_D1, InpEMA_D1_Period, 0, InpEMA_D1_Method, InpEMA_D1_Price);
+      if(h_EMA_D1_Bias == INVALID_HANDLE)
+        {
+         PrintFormat("Error init D1 EMA%d (Bias). Code: %d", InpEMA_D1_Period, GetLastError());
+         return(INIT_FAILED);
+        }
+
+      h_EMA_H4_Bias = iMA(_Symbol, PERIOD_H4, InpEMA_H4_Period, 0, InpEMA_H4_Method, InpEMA_H4_Price);
+      if(h_EMA_H4_Bias == INVALID_HANDLE)
+        {
+         PrintFormat("Error init H4 EMA%d (Bias). Code: %d", InpEMA_H4_Period, GetLastError());
+         return(INIT_FAILED);
+        }
+
+      h_M30_EMA_Bias = iMA(_Symbol, PERIOD_M30, InpEMA_M30_Period, 0, InpEMA_M30_Method, InpEMA_M30_Price);
+      if(h_M30_EMA_Bias == INVALID_HANDLE)
+        {
+         PrintFormat("Error init M30 EMA%d (Bias). Code: %d", InpEMA_M30_Period, GetLastError());
+         return(INIT_FAILED);
+        }
+
+      h_M5_EMA_Bias = iMA(_Symbol, PERIOD_M5, InpEMA_M5_Period, 0, InpEMA_M5_Method, InpEMA_M5_Price);
+      if(h_M5_EMA_Bias == INVALID_HANDLE)
+        {
+         PrintFormat("Error init M5 EMA%d (Bias). Code: %d", InpEMA_M5_Period, GetLastError());
+         return(INIT_FAILED);
+        }
+     }
+//--- Initialize Trade Cycle
+   g_current_trade_cycle.is_active = false;
+   g_current_trade_cycle.status = CYCLE_EMPTY;
+   ArrayResize(g_current_trade_cycle.dca_trades, 0);
+
+//--- Initialize Indicators ---
+   if(g_enable_bias_logic)
+     {
+      h_D1_EMA200 = iMA(_Symbol, PERIOD_D1, InpD1EmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      if(h_D1_EMA200 == INVALID_HANDLE) { /*...*/ return(INIT_FAILED); }
+
+      h_M15_RSI14 = iRSI(_Symbol, PERIOD_M15, InpM15RsiPeriod, PRICE_CLOSE);
+      if(h_M15_RSI14 == INVALID_HANDLE) { /*...*/ return(INIT_FAILED); }
+
+      // Initialize M5 ATR if Bias Logic (which includes M5 Reversal that needs ATR) is enabled
+      // และถ้าจะใช้ ZigZag ก็ไม่จำเป็นต้องมี h_M5_ATR14 สำหรับ FindSwingPoints_ZigZag
+      // แต่ส่วน M5 Reversal Logic ใน GetUpdatedDailyBiasSignal ยังคงใช้ m5_atr_val อยู่
+      // ดังนั้น เรายังคง Initialize h_M5_ATR14 ไว้
+      h_M5_ATR14 = iATR(_Symbol, PERIOD_M5, InpM5AtrPeriod);
+      if(h_M5_ATR14 == INVALID_HANDLE)
+        {
+         PrintFormat("Error init M5 ATR%d. Code: %d", InpM5AtrPeriod, GetLastError());
+         return(INIT_FAILED);
+        }
+     }
+   if(g_enable_initial_entry_logic)   // ชื่อ Input Parameter ควรจะเป็น g_enable_initial_entry_logic
+     {
+      h_M5_EMA9 = iMA(_Symbol, PERIOD_M5, InpM5EmaFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      if(h_M5_EMA9 == INVALID_HANDLE) { /*...*/ return(INIT_FAILED); }
+
+      h_M5_EMA20 = iMA(_Symbol, PERIOD_M5, InpM5EmaSlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      if(h_M5_EMA20 == INVALID_HANDLE) { /*...*/ return(INIT_FAILED); }
+     }
+
+   PrintFormat("%s Initialized. Magic: %lu. Symbol: %s", MQLInfoString(MQL_PROGRAM_NAME), g_magic_number, _Symbol);
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   PrintFormat("%s Deinitialized. Reason: %d", MQLInfoString(MQL_PROGRAM_NAME), reason);
+   if(h_D1_EMA200 != INVALID_HANDLE)
+      IndicatorRelease(h_D1_EMA200);
+   if(h_M15_RSI14 != INVALID_HANDLE)
+      IndicatorRelease(h_M15_RSI14);
+   if(h_M5_EMA9  != INVALID_HANDLE)
+      IndicatorRelease(h_M5_EMA9);
+   if(h_M5_EMA20 != INVALID_HANDLE)
+      IndicatorRelease(h_M5_EMA20);
+// if(h_M5_EMA50 != INVALID_HANDLE) IndicatorRelease(h_M5_EMA50);
+   if(h_M5_ATR14 != INVALID_HANDLE)
+      IndicatorRelease(h_M5_ATR14);
+   if(h_EMA_D1_Bias != INVALID_HANDLE)
+      IndicatorRelease(h_EMA_D1_Bias);
+   if(h_H4_EMA_Bias != INVALID_HANDLE)
+      IndicatorRelease(h_H4_EMA_Bias);
+   if(h_M30_EMA_Bias != INVALID_HANDLE)
+      IndicatorRelease(h_M30_EMA_Bias);
+   if(h_M5_EMA_Bias != INVALID_HANDLE)
+      IndicatorRelease(h_M5_EMA_Bias);
+   Comment("");
+  }
+
+
+
+//+------------------------------------------------------------------+
+//| (STUB) Checks if global trading conditions are met.              |
+//+------------------------------------------------------------------+
+bool IsTradingAllowedGlobally()
+  {
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+     {
+      //Print("Error: Autotrading is not enabled in Terminal options."); // Can be noisy, enable for debug
+      return false;
+     }
+   if(!account.TradeAllowed())
+     {
+      //Print("Error: Trading is not allowed for this account."); // Can be noisy
+      return false;
+     }
+   if(IsStopped())
+     {
+      Print("EA execution was stopped by user.");
+      return false;
+     }
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| (STUB) Performs overall margin check before opening a new trade. |
+//+------------------------------------------------------------------+
+bool PerformOverallMarginCheck()
+  {
+   if(account.FreeMargin() < (g_required_margin_equity_ratio * account.Equity()))
+     {
+      PrintFormat("Margin Check Failed: Free Margin %.2f is less than %.2f%% of Equity %.2f (Required: %.2f). No new trades.",
+                  account.FreeMargin(), g_required_margin_equity_ratio * 100, account.Equity(), g_required_margin_equity_ratio * account.Equity());
+      return false;
+     }
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Finds Swing Points using manual high/low comparison.             |
+//+------------------------------------------------------------------+
+void FindSwingPoints(ENUM_TIMEFRAMES tf, SwingPoint &swings_arr[], int depth, int bars_lookback)
+  {
+   ArrayResize(swings_arr, 0);
+   if(depth <= 0 || bars_lookback <= (depth * 2) + 1)
+      return;
+
+   for(int current_shift = depth; current_shift <= bars_lookback - 1 - depth; current_shift++)
+     {
+      bool is_swing_high = true;
+      double high_at_current_shift = iHigh(_Symbol, tf, current_shift);
+      if(!MathIsValidNumber(high_at_current_shift) || high_at_current_shift == 0)
+         continue;
+      for(int j = 1; j <= depth; j++)
+        {
+         if(high_at_current_shift <= iHigh(_Symbol, tf, current_shift - j) ||
+            high_at_current_shift <= iHigh(_Symbol, tf, current_shift + j))
+           {
+            is_swing_high = false;
+            break;
+           }
+        }
+      if(is_swing_high)
+        {
+         int size = ArraySize(swings_arr);
+         ArrayResize(swings_arr, size + 1);
+         swings_arr[size].time = iTime(_Symbol, tf, current_shift);
+         swings_arr[size].price = high_at_current_shift;
+         swings_arr[size].isHigh = true;
+         swings_arr[size].shift = current_shift;
+        }
+      bool is_swing_low = true;
+      double low_at_current_shift = iLow(_Symbol, tf, current_shift);
+      if(!MathIsValidNumber(low_at_current_shift) || low_at_current_shift == 0)
+         continue;
+      for(int j = 1; j <= depth; j++)
+        {
+         if(low_at_current_shift >= iLow(_Symbol, tf, current_shift - j) ||
+            low_at_current_shift >= iLow(_Symbol, tf, current_shift + j))
+           {
+            is_swing_low = false;
+            break;
+           }
+        }
+      if(is_swing_low)
+        {
+         int size = ArraySize(swings_arr);
+         ArrayResize(swings_arr, size + 1);
+         swings_arr[size].time = iTime(_Symbol, tf, current_shift);
+         swings_arr[size].price = low_at_current_shift;
+         swings_arr[size].isHigh = false;
+         swings_arr[size].shift = current_shift;
+        }
+     }
+   if(ArraySize(swings_arr) > 1)   // Sort by shift ascending (most recent first)
+     {
+      for(int i = 0; i < ArraySize(swings_arr) - 1; i++)
+        {
+         for(int j = i + 1; j < ArraySize(swings_arr); j++)
+           {
+            if(swings_arr[j].shift < swings_arr[i].shift)
+              {
+               SwingPoint temp = swings_arr[i];
+               swings_arr[i] = swings_arr[j];
+               swings_arr[j] = temp;
+              }
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Finds Swing Points using the ZigZag indicator.                   |
+//+------------------------------------------------------------------+
+void FindSwingPoints_ZigZag(ENUM_TIMEFRAMES tf, SwingPoint &swings_arr[],
+                            int zigZagDepth, int zigZagDeviation, int zigZagBackstep,
+                            int bars_to_scan)
+  {
+   ArrayResize(swings_arr, 0);
+   if(bars_to_scan <= 0)
+      bars_to_scan = InpM5SwingLookback; // Use a consistent lookback
+   if(zigZagDepth <=0 || zigZagDeviation <=0 || zigZagBackstep <=0)
+      return;
+
+   string zigzag_path = "Examples\\ZigZag";
+   int zigzag_handle = iCustom(_Symbol, tf, zigzag_path, zigZagDepth, zigZagDeviation, zigZagBackstep);
+   if(zigzag_handle == INVALID_HANDLE)
+      return;
+
+   double high_buffer[];
+   double low_buffer[];
+   ArraySetAsSeries(high_buffer, true);
+   ArraySetAsSeries(low_buffer, true);
+   int copied_high = CopyBuffer(zigzag_handle, 1, 0, bars_to_scan, high_buffer);
+   int copied_low  = CopyBuffer(zigzag_handle, 2, 0, bars_to_scan, low_buffer);
+   IndicatorRelease(zigzag_handle);
+   if(copied_high <= 0 || copied_low <= 0)
+      return;
+
+   SwingPoint temp_swings[];
+   int temp_swing_count = 0;
+   for(int shift = 0; shift < MathMin(copied_high, copied_low); shift++)   // Consider from shift 0 for ZigZag
+     {
+      SwingPoint current_sp;
+      bool found_at_shift = false;
+      if(high_buffer[shift] != 0 && high_buffer[shift] != EMPTY_VALUE)
+        {
+         current_sp.price = high_buffer[shift];
+         current_sp.isHigh = true;
+         found_at_shift = true;
+        }
+      else
+         if(low_buffer[shift] != 0 && low_buffer[shift] != EMPTY_VALUE)
+           {
+            current_sp.price = low_buffer[shift];
+            current_sp.isHigh = false;
+            found_at_shift = true;
+           }
+      if(found_at_shift)
+        {
+         current_sp.shift = shift;
+         current_sp.time = iTime(_Symbol, tf, shift);
+         ArrayResize(temp_swings, temp_swing_count + 1);
+         temp_swings[temp_swing_count++] = current_sp;
+        }
+     }
+   ArrayResize(swings_arr, temp_swing_count);
+   for(int i=0; i < temp_swing_count; i++)
+      swings_arr[i] = temp_swings[i];
+// Note: ZigZag points are typically already somewhat "sorted" by time/occurrence.
+// The loop iterates from shift 0 backwards, so swings_arr[0] should be the most recent from ZigZag.
+  }
+
+
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void DrawSwingLabels(const SwingPoint &swings_arr[])
+  {
+// ลบ label เก่าออก (ลาก่อาจเก็บ Swing_H/L ในจำนวนเกินไว้)
+   for(int i=0; i<500; i++)
+     {
+      string objname_high = StringFormat("Swing_H_%d",i);
+      string objname_low  = StringFormat("Swing_L_%d",i);
+      ObjectDelete(0, objname_high);
+      ObjectDelete(0, objname_low);
+     }
+
+   for(int i=0; i < ArraySize(swings_arr); i++)
+     {
+      string lbl_name = StringFormat("Swing_%s_%d", swings_arr[i].isHigh ? "H":"L", swings_arr[i].time);
+      string lbl_text = StringFormat("%s\n%.5f", swings_arr[i].isHigh ? "High":"Low", swings_arr[i].price);
+
+      int x, y;
+      if(ChartTimePriceToXY(0, 0, swings_arr[i].time, swings_arr[i].price, x, y))
+        {
+         if(ObjectCreate(0, lbl_name, OBJ_LABEL, 0, 0, 0))
+           {
+            ObjectSetString(0, lbl_name, OBJPROP_TEXT, lbl_text);
+            ObjectSetInteger(0, lbl_name, OBJPROP_XDISTANCE, x);
+            ObjectSetInteger(0, lbl_name, OBJPROP_YDISTANCE, y);
+            ObjectSetInteger(0, lbl_name, OBJPROP_COLOR, swings_arr[i].isHigh ? clrRed : clrBlue);
+            ObjectSetInteger(0, lbl_name, OBJPROP_FONTSIZE, 9);
+            ObjectSetInteger(0, lbl_name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+            ObjectSetInteger(0, lbl_name, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(0, lbl_name, OBJPROP_HIDDEN, true);
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Calculates the Multi-Timeframe EMA Bias based on 4 TFs.          |
+//| Returns an ENUM_BIAS_STATUS representing the overall strength.   |
+//+------------------------------------------------------------------+
+ENUM_BIAS_STATUS CalculateMultiTimeframeEmaBias()
+  {
+   if(!g_enable_bias_logic)
+      return BIAS_NEUTRAL;
+
+   int bullish_score = 0;
+   int bearish_score = 0;
+   int neutral_or_invalid_tf_count = 0;
+   int valid_data_points = 0;
+
+// ใช้ราคาปิดของแท่ง M5 ปัจจุบัน (แท่งที่กำลังก่อตัว)
+// หรือถ้าต้องการความแน่นอน อาจจะใช้ราคาปิดของแท่ง M5 ที่เพิ่งปิดไป (shift 1)
+// แต่ Close[0] ก็ใช้ได้สำหรับการประเมิน Bias ในแต่ละ Tick
+   double currentPrice = iClose(_Symbol, PERIOD_M5, 0); // <--- เปลี่ยนตรงนี้
+// หรือถ้าต้องการราคาล่าสุดจริงๆ อาจจะใช้ (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2;
+// แต่ Close[0] บน M5 จะเปลี่ยนก็ต่อเมื่อมี Tick ใหม่เข้ามาและราคาปิดของ M5 ปัจจุบันมีการเปลี่ยนแปลง
+
+   if(currentPrice == 0 && MQLInfoInteger(MQL_TESTER) == false)    // ตรวจสอบว่าได้ราคาที่ถูกต้อง
+     {
+      Print("CalculateMultiTimeframeEmaBias: Current M5 Close[0] is zero. Skipping calculation this tick.");
+      return BIAS_NEUTRAL; // หรือสถานะที่เหมาะสมเมื่อไม่มีราคาปัจจุบัน
+     }
+
+
+   double ema_val[1];
+
+// --- D1 EMA Bias ---
+   if(h_EMA_D1_Bias != INVALID_HANDLE && CopyBuffer(h_EMA_D1_Bias, 0, 0, 1, ema_val) == 1 && ema_val[0] != 0.0 && MathIsValidNumber(ema_val[0]))
+     {
+      valid_data_points++;
+      if(currentPrice > ema_val[0])
+         bullish_score++;
+      else
+         if(currentPrice < ema_val[0])
+            bearish_score++;
+         else
+            neutral_or_invalid_tf_count++;
+     }
+   else
+     {
+      neutral_or_invalid_tf_count++;
+      if(h_EMA_D1_Bias == INVALID_HANDLE && g_enable_bias_logic)
+         Print("CalcMultiTFEMA: D1 EMA Handle invalid.");
+     }
+
+// --- H4 EMA Bias ---
+   if(h_EMA_H4_Bias != INVALID_HANDLE && CopyBuffer(h_EMA_H4_Bias, 0, 0, 1, ema_val) == 1 && ema_val[0] != 0.0 && MathIsValidNumber(ema_val[0]))
+     {
+      valid_data_points++;
+      if(currentPrice > ema_val[0])
+         bullish_score++;
+      else
+         if(currentPrice < ema_val[0])
+            bearish_score++;
+         else
+            neutral_or_invalid_tf_count++;
+     }
+   else
+     {
+      neutral_or_invalid_tf_count++;
+      if(h_EMA_H4_Bias == INVALID_HANDLE && g_enable_bias_logic)
+         Print("CalcMultiTFEMA: H4 EMA Handle invalid.");
+     }
+
+// --- M30 EMA Bias ---
+   if(h_M30_EMA_Bias != INVALID_HANDLE && CopyBuffer(h_M30_EMA_Bias, 0, 0, 1, ema_val) == 1 && ema_val[0] != 0.0 && MathIsValidNumber(ema_val[0]))
+     {
+      valid_data_points++;
+      if(currentPrice > ema_val[0])
+         bullish_score++;
+      else
+         if(currentPrice < ema_val[0])
+            bearish_score++;
+         else
+            neutral_or_invalid_tf_count++;
+     }
+   else
+     {
+      neutral_or_invalid_tf_count++;
+      if(h_M30_EMA_Bias == INVALID_HANDLE && g_enable_bias_logic)
+         Print("CalcMultiTFEMA: M30 EMA Handle invalid.");
+     }
+
+// --- M5 EMA Bias (ใช้ EMA ที่กำหนดสำหรับ Bias ไม่ใช่สำหรับ Entry) ---
+   if(h_M5_EMA_Bias != INVALID_HANDLE && CopyBuffer(h_M5_EMA_Bias, 0, 0, 1, ema_val) == 1 && ema_val[0] != 0.0 && MathIsValidNumber(ema_val[0]))
+     {
+      valid_data_points++;
+      if(currentPrice > ema_val[0])
+         bullish_score++;
+      else
+         if(currentPrice < ema_val[0])
+            bearish_score++;
+         else
+            neutral_or_invalid_tf_count++;
+     }
+   else
+     {
+      neutral_or_invalid_tf_count++;
+      if(h_M5_EMA_Bias == INVALID_HANDLE && g_enable_bias_logic)
+         Print("CalcMultiTFEMA: M5 EMA Bias Handle invalid.");
+     }
+
+
+// ... (ตรรกะที่เหลือเหมือนเดิม)
+// ตัวอย่างจากครั้งก่อน:
+   if(bullish_score == 4 && bearish_score == 0)
+      return BIAS_BULLISH_VERY_STRONG;
+   if(bullish_score == 3 && bearish_score == 1)
+      return BIAS_BULLISH_STRONG;
+   if(bullish_score == 2 && bearish_score == 2)
+      return BIAS_NEUTRAL;
+   if(bullish_score == 1 && bearish_score == 3)
+      return BIAS_BEARISH_STRONG;
+   if(bullish_score == 0 && bearish_score == 4)
+      return BIAS_BEARISH_VERY_STRONG;
+   return BIAS_NEUTRAL;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+InitialTradeSignalDetails GetM5FollowTrendSignalDetails(ENUM_BIAS_STATUS currentStrongTrendBias)
+  {
+   InitialTradeSignalDetails signal;
+   signal.isValid = false;
+   if(!InpEnableFollowTrend)
+      return signal;
+
+   ENUM_ORDER_TYPE tradeDirection = WRONG_VALUE;
+   if(currentStrongTrendBias == BIAS_BULLISH_VERY_STRONG || currentStrongTrendBias == BIAS_BULLISH_STRONG)
+      tradeDirection = ORDER_TYPE_BUY;
+   else
+      if(currentStrongTrendBias == BIAS_BEARISH_VERY_STRONG || currentStrongTrendBias == BIAS_BEARISH_STRONG)
+         tradeDirection = ORDER_TYPE_SELL;
+      else
+         return signal; // ไม่ใช่ Bias ที่แข็งแรงพอสำหรับ Follow Trend
+
+// --- 1. หา Swing Points บน InpBoSTimeframe (เช่น M15) ---
+   SwingPoint m15_swings[];
+   FindSwingPoints(InpBoSTimeframe, m15_swings, InpBoSSwingDepth, InpBoSSwingLookback);
+   if(ArraySize(m15_swings) < 2) { /* Print("No M15 swings for BoS"); */ return signal; }
+
+// --- 2. Detect BoS (Break of Structure) บน M15 ---
+// (ตรรกะนี้จะซับซ้อน ต้องหากลุ่ม Swing ที่จะ Break และแท่ง Breakout ที่แข็งแรง)
+// สมมติว่าเรามีฟังก์ชัน IsM15BoSConfirmed(...) ที่คืนค่า true และให้ข้อมูล BoS Level, BoS Candle Shift
+   double bos_level = 0;
+   int bos_candle_shift_m15 = -1; // Shift ของแท่ง BoS บน M15
+
+// *** TODO: Implement IsM15BoSConfirmed(...) ***
+// ฟังก์ชันนี้จะ:
+//   - ถ้า tradeDirection == ORDER_TYPE_BUY:
+//     - หากลุ่ม Swing High ล่าสุดบน M15 (เช่น m15_swings[1] ถ้าเป็น High และ m15_swings[0] เป็น Low หลัง High นั้น)
+//     - ตรวจสอบว่ามีแท่ง M15 (shift > 0) ที่ปิดเหนือ Swing High นั้นอย่างแข็งแรง (ใช้ ATR และ Body Ratio)
+//   - ถ้า tradeDirection == ORDER_TYPE_SELL:
+//     - หากลุ่ม Swing Low ล่าสุดบน M15
+//     - ตรวจสอบว่ามีแท่ง M15 ที่ปิดต่ำกว่า Swing Low นั้นอย่างแข็งแรง
+//   - ถ้าเจอ BoS ให้ bos_level = ราคา Swing ที่ถูก Break, bos_candle_shift_m15 = shift ของแท่ง BoS
+
+// ตัวอย่างการเรียก (Placeholder):
+// if (!IsM15BoSConfirmed(tradeDirection, m15_swings, bos_level, bos_candle_shift_m15)) return signal;
+
+
+// --- 3. รอ Pullback บน M15 มาที่โซน BoS Level หรือ M15 EMA ---
+// (ต้อง Implement IsM15PullbackOccurred(...))
+   bool pullback_occurred = false;
+   int pullback_candle_shift_m15 = -1; // Shift ของแท่ง M15 ที่เกิด Pullback และ Hold
+
+// *** TODO: Implement IsM15PullbackOccurred(...) ***
+// ฟังก์ชันนี้จะ:
+//  - วน Loop ดูแท่ง M15 หลังจาก BoS Candle (shift < bos_candle_shift_m15) ไม่เกิน InpPullbackMaxBars แท่ง
+//  - ตรวจสอบว่าราคา Low (สำหรับ Buy) หรือ High (สำหรับ Sell) ของแท่งนั้น ย่อ/ดีด กลับมาใกล้ bos_level
+//    หรือใกล้เส้น EMA(InpM15_EMA_Pullback) บน M15
+//  - ตรวจสอบว่าการย่อตัวไม่ทะลุระดับสำคัญกลับเข้าไปมากเกินไป (ใช้ InpPullbackRetraceMaxATR)
+//  - และราคาปิดของแท่ง Pullback นั้นแสดงการ "Hold" (เช่น ปิดเหนือ bos_level สำหรับ Buy)
+//  - ถ้าเจอ ให้ pullback_occurred = true, pullback_candle_shift_m15 = shift ของแท่งนั้น
+
+// ตัวอย่างการเรียก (Placeholder):
+// if(!IsM15PullbackOccurred(tradeDirection, bos_level, bos_candle_shift_m15, pullback_candle_shift_m15)) return signal;
+
+
+// --- 4. หา Price Action Confirmation บน M5 ณ เวลาที่ M15 Pullback & Hold ---
+// (ส่วนนี้จะทำงานเมื่อขึ้นแท่ง M5 ใหม่ และ M15 เพิ่งจะ Confirm Pullback & Hold)
+// เราจะต้องเทียบเวลาของ pullback_candle_shift_m15 กับเวลาของแท่ง M5 ปัจจุบัน
+// หรืออาจจะง่ายกว่าคือ ถ้า M15 Pullback & Hold เพิ่ง Confirm ในแท่ง M15 ที่แล้ว
+// ให้ EA มองหาสัญญาณ PA บน M5 ในช่วง 2-3 แท่ง M5 ที่ผ่านมา
+// (ตรรกะ M5 PA Confirmation เหมือนเดิมที่เราทำใน GetM5InitialEntrySignal)
+
+   bool m5_pa_confirmed = false;
+// *** TODO: Implement M5 PA Check based on M15 Pullback Timing ***
+// if (M15 Pullback & Hold เพิ่งจบในแท่ง M15 ที่แล้ว หรือ 2 แท่งที่แล้ว) {
+//    if(entryDirection == ORDER_TYPE_BUY && IsStrongBullishEngulfing(PERIOD_M5, 1, InpM5EngulfMinBodyRatio)) m5_pa_confirmed = true;
+//    else if(entryDirection == ORDER_TYPE_SELL && IsStrongBearishEngulfing(PERIOD_M5, 1, InpM5EngulfMinBodyRatio)) m5_pa_confirmed = true;
+//    // อาจจะเพิ่ม Pin Bar หรือ PA อื่นๆ
+// }
+
+// ตัวอย่างการเรียก (Placeholder):
+// if(!CheckM5ConfirmationAfterM15Pullback(tradeDirection, pullback_candle_shift_m15)) return signal;
+
+
+// --- ถ้าทุกเงื่อนไขผ่าน ---
+// if (m5_pa_confirmed) // Placeholder จาก TODO ด้านบน
+// {
+//     signal.isValid = true;
+//     signal.orderType = tradeDirection;
+//     signal.entryPriceSuggestion = (tradeDirection == ORDER_TYPE_BUY) ? g_symbolInfo.Ask() : g_symbolInfo.Bid();
+//     // SL เสมือน อาจจะอิงจาก Low/High ของแท่ง M5 PA หรือ Low/High ของ M15 Pullback Bar
+//     // signal.calculatedStopLoss = ... ;
+//     signal.signalDescription = "M15_BoS_PB_M5PA_" + (tradeDirection == ORDER_TYPE_BUY ? "Buy" : "Sell");
+//     PrintFormat("GetM5FollowTrendSignal: VALID! %s", signal.signalDescription);
+// }
+
+   return signal;
+  }
+//+------------------------------------------------------------------+
+//| Gets M5 initial entry signal based on bias, momentum, confirm.   |
+//+------------------------------------------------------------------+
+InitialTradeSignalDetails GetM5InitialEntrySignal(ENUM_BIAS_STATUS currentBias)
+  {
+   InitialTradeSignalDetails signal;
+   signal.isValid = false;
+   signal.calculatedStopLoss = 0; // Initialize
+
+   if(!g_enable_initial_entry_logic) // ใช้ Global Variable ที่ Map จาก Input
+      return signal;
+
+// --- 1. Determine Allowed Trading Direction from currentBias ---
+   ENUM_ORDER_TYPE entryDirection = WRONG_VALUE; // WRONG_VALUE หรือค่าเริ่มต้นที่ไม่ใช่ Buy/Sell
+   bool biasPermitsTrade = false;
+
+   switch(currentBias)
+     {
+      // --- Bias ที่สนับสนุนการ BUY ---
+      case BIAS_BULLISH_VERY_STRONG:      // จาก Multi-TF EMA Score
+      // case BIAS_D1_BULLISH_STRONG:     // (ถ้ายังใช้อยู่ หรือรวมเป็นเงื่อนไขเสริม)
+      // case BIAS_D1_BULLISH_MODERATE:   // (ถ้ายังใช้อยู่ หรือรวมเป็นเงื่อนไขเสริม)
+      case SIGNAL_REVERSAL_UP_M5:         // M5 Reversal Up ชัดเจน
+      case SIGNAL_REVERSAL_UP_M15:        // M15 Reversal Up ชัดเจน (TODO)
+      case SIGNAL_OVS_M15:                // M15 Oversold (เดิมเป็น SIGNAL_OVS_H1) อาจเป็นจังหวะย่อซื้อที่ดี ถ้าภาพรวมยังเอื้อ
+      case SIGNAL_CONTINUATION_BULLISH_M5: // M5 Continuation Bullish
+         entryDirection = ORDER_TYPE_BUY;
+         biasPermitsTrade = true;
+         break;
+
+      // --- Bias ที่สนับสนุนการ SELL ---
+      case BIAS_BEARISH_VERY_STRONG:      // จาก Multi-TF EMA Score
+
+
+      // case BIAS_D1_BEARISH_STRONG:     // (ถ้ายังใช้อยู่ หรือรวมเป็นเงื่อนไขเสริม)
+      // case BIAS_D1_BEARISH_MODERATE:   // (ถ้ายังใช้อยู่ หรือรวมเป็นเงื่อนไขเสริม)
+      case SIGNAL_REVERSAL_DOWN_M5:       // M5 Reversal Down ชัดเจน
+      case SIGNAL_REVERSAL_DOWN_M15:      // M15 Reversal Down ชัดเจน (TODO)
+      case SIGNAL_OVB_M15:                // M15 Overbought (เดิมเป็น SIGNAL_OVB_H1) อาจเป็นจังหวะย่อขายที่ดี ถ้าภาพรวมยังเอื้อ
+      case SIGNAL_CONTINUATION_BEARISH_M5: // M5 Continuation Bearish
+         entryDirection = ORDER_TYPE_SELL;
+         biasPermitsTrade = true;
+         break;
+
+      // --- Bias ที่ไม่ควรเปิด Initial Trade หรือต้องมีเงื่อนไขพิเศษ ---
+      case BIAS_NEUTRAL:                  // Neutral โดยรวม
+      case BIAS_RANGING_CONFIRMED:        // สัญญาณ Ranging ชัดเจนจาก Multi-TF EMA Score
+      // case BIAS_D1_RANGING:            // (ถ้ายังใช้อยู่)
+      default:                            // กรณีอื่นๆ ที่ไม่เข้าพวก
+         biasPermitsTrade = false;
+         // PrintFormat("GetM5InitialEntrySignal: Bias (%s) does not permit new initial trades at this moment.", EnumToString(currentBias));
+         // ไม่ return signal ทันที เพราะอาจจะมี Logic อื่นๆ ที่อยากให้ทำงานก่อน return (แม้ว่าปัจจุบันจะไม่มี)
+         break;
+     }
+
+   if(!biasPermitsTrade)
+     {
+      // PrintFormat("GetM5InitialEntrySignal: Bias (%s) results in biasPermitsTrade = false.", EnumToString(currentBias));
+      return signal; // ออกจากฟังก์ชันถ้า Bias ไม่เอื้ออำนวยจริงๆ
+     }
+
+// --- 2. Check Momentum on M5 (EMA9 vs EMA20 on last closed bar) ---
+   bool momentumConfirmed = false;
+   double ema9_M5_s1[1], ema20_M5_s1[1]; // Request 1 bar (shift 1)
+
+   if(h_M5_EMA9 != INVALID_HANDLE && h_M5_EMA20 != INVALID_HANDLE &&
+      CopyBuffer(h_M5_EMA9, 0, 1, 1, ema9_M5_s1) == 1 && CopyBuffer(h_M5_EMA20, 0, 1, 1, ema20_M5_s1) == 1)
+     {
+      double close_M5_s1 = iClose(_Symbol, PERIOD_M5, 1); // Last closed M5 bar
+
+      if(entryDirection == ORDER_TYPE_BUY)
+        {
+         if(close_M5_s1 > ema9_M5_s1[0] && ema9_M5_s1[0] > ema20_M5_s1[0])
+            momentumConfirmed = true;
+        }
+      else // ORDER_TYPE_SELL
+        {
+         if(close_M5_s1 < ema9_M5_s1[0] && ema9_M5_s1[0] < ema20_M5_s1[0])
+            momentumConfirmed = true;
+        }
+     }
+   else
+     {
+      Print("GetM5InitialEntrySignal: Error copying M5 EMA buffers for momentum check.");
+      return signal;
+     }
+
+   if(!momentumConfirmed)
+     {
+      // PrintFormat("GetM5InitialEntrySignal: M5 Momentum not confirmed for %s.", EnumToString(entryDirection));
+      return signal;
+     }
+// PrintFormat("GetM5InitialEntrySignal: M5 Momentum Confirmed for %s", EnumToString(entryDirection));
+
+// --- 3. Check Confirmation on M5 (Engulfing on last closed M5 bar - shift 1) ---
+   bool entryConfirmed = false;
+   double open_s1 = iOpen(_Symbol, PERIOD_M5, 1);
+   double close_s1 = iClose(_Symbol, PERIOD_M5, 1); // Redundant, already have it as close_M5_s1
+   double high_s1 = iHigh(_Symbol, PERIOD_M5, 1);
+   double low_s1 = iLow(_Symbol, PERIOD_M5, 1);
+   double open_s2 = iOpen(_Symbol, PERIOD_M5, 2);
+   double close_s2 = iClose(_Symbol, PERIOD_M5, 2);
+   double body_s1 = MathAbs(close_s1 - open_s1);
+   double body_s2 = MathAbs(close_s2 - open_s2);
+
+// Filter out very small candles
+   if(body_s1 < g_symbolInfo.Point() * 5 || body_s2 < g_symbolInfo.Point() * 5)
+     {
+      // Print("GetM5InitialEntrySignal: Engulfing check skipped, candle body too small.");
+      return signal;
+     }
+
+   if(entryDirection == ORDER_TYPE_BUY)
+     {
+      // Bullish Engulfing: bar_s1 (Bullish) engulfs body of bar_s2 (Bearish)
+      if(close_s1 > open_s1 &&           // bar_s1 is Bullish
+         close_s2 < open_s2 &&           // bar_s2 is Bearish
+         close_s1 > open_s2 &&           // bar_s1 closes above bar_s2 open
+         open_s1 < close_s2 &&           // bar_s1 opens below bar_s2 close
+         body_s1 > body_s2 * InpM5EngulfMinBodyRatio) // bar_s1 body significantly larger
+        {
+         entryConfirmed = true;
+         signal.signalDescription = "M5_EMA_BullEngulf";
+         signal.calculatedStopLoss = low_s1 - (g_symbolInfo.Point() * InpHedgeTriggerPipsAgainst); // ใช้ InpHedgeTriggerPipsAgainst เป็น SL เสมือนชั่วคราว
+        }
+     }
+   else // ORDER_TYPE_SELL
+     {
+      // Bearish Engulfing: bar_s1 (Bearish) engulfs body of bar_s2 (Bullish)
+      if(close_s1 < open_s1 &&           // bar_s1 is Bearish
+         close_s2 > open_s2 &&           // bar_s2 is Bullish
+         close_s1 < open_s2 &&           // bar_s1 closes below bar_s2 open
+         open_s1 > close_s2 &&           // bar_s1 opens above bar_s2 close
+         body_s1 > body_s2 * InpM5EngulfMinBodyRatio)
+        {
+         entryConfirmed = true;
+         signal.signalDescription = "M5_EMA_BearEngulf";
+         signal.calculatedStopLoss = high_s1 + (g_symbolInfo.Point() * InpHedgeTriggerPipsAgainst);
+        }
+     }
+
+   if(!entryConfirmed)
+     {
+      // PrintFormat("GetM5InitialEntrySignal: M5 Confirmation (Engulfing) not found for %s", EnumToString(entryDirection));
+      return signal;
+     }
+// PrintFormat("GetM5InitialEntrySignal: M5 Confirmation (Engulfing) Found for %s", EnumToString(entryDirection));
+
+// --- 4. All Conditions Met ---
+   signal.isValid = true;
+   signal.orderType = entryDirection;
+   signal.entryPriceSuggestion = (entryDirection == ORDER_TYPE_BUY) ? g_symbolInfo.Ask() : g_symbolInfo.Bid();
+
+   PrintFormat("GetM5InitialEntrySignal: VALID SIGNAL FOUND! Bias: %s, AllowedDir: %s, Momentum: OK, Confirm: %s, SL_Virt: %.5f",
+               EnumToString(currentBias), EnumToString(signal.orderType), signal.signalDescription, signal.calculatedStopLoss);
+
+   return signal;
+  }
+//+------------------------------------------------------------------+
+//| Manages a single active trade cycle.                             |
+//+------------------------------------------------------------------+
+void ManageSingleTradeCycle(TradeCycle &cycle, ENUM_BIAS_STATUS currentBias)
+  {
+   if(!cycle.is_active)
+      return;
+   double actual_pl_on_exit_signal = 0;
+   if(HasBasketExitSignal(cycle, actual_pl_on_exit_signal)) // <--- เรียกใช้ฟังก์ชันตรวจสอบสัญญาณ Exit
+     {
+      PrintFormat("ManageSingleTradeCycle: Basket Exit Signal detected for Cycle %s. Actual P/L at signal: %.2f USD. Closing trades.",
+                  cycle.id, actual_pl_on_exit_signal);
+      CloseAllTradesInCycle(cycle, "BasketTP_TriggeredBySignal");
+      ResetTradeCycle(cycle);
+      return; // Cycle จบแล้ว
+     }
+   if(CheckAndCloseProfitableBasket(cycle)) // ตรวจสอบการปิด Basket ก่อนเสมอ
+     {
+      return;
+     }
+
+   switch(cycle.status)
+     {
+      case CYCLE_INITIAL_TRADE_OPEN:
+        {
+         if(cycle.initial_trade.ticket == 0 || cycle.initial_trade.initial_lot <= 0)
+           {
+            PrintFormat("ERROR ManageCycle: Initial trade data missing in active cycle ID %s. Resetting.", cycle.id);
+            ResetTradeCycle(cycle);
+            return;
+           }
+         if(g_use_hedging && ShouldHedge(cycle.initial_trade, currentBias))
+           {
+            PrintFormat("ManageCycle: Hedging condition met for Initial Order #%lu (Type: %s) due to Bias: %s",
+                        cycle.initial_trade.ticket, EnumToString(cycle.initial_trade.type), EnumToString(currentBias));
+            if(!PerformOverallMarginCheck())
+              {
+               Print("ManageCycle: Margin check failed for Hedge. Waiting.");
+               return;
+              }
+            double hedgeLot = CalculateHedgeLot(cycle.initial_trade.initial_lot);
+            if(hedgeLot <= 0)
+              {
+               PrintFormat("ManageCycle: Calculated Hedge Lot is zero or invalid (%.2f). Cannot Hedge.", hedgeLot);
+               return;
+              }
+            ENUM_ORDER_TYPE hedgeOrderType = (cycle.initial_trade.type == ORDER_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+            double hedgeMarketOpenPrice = SymbolInfoDouble(_Symbol, (hedgeOrderType == ORDER_TYPE_BUY) ? SYMBOL_ASK : SYMBOL_BID);
+
+            // เรียก ExecuteHedgeTrade ที่ใช้ CTrade แล้ว
+            ulong hedgeTicket = ExecuteHedgeTrade(cycle, hedgeOrderType, hedgeMarketOpenPrice, hedgeLot);
+
+            if(hedgeTicket > 0)   // hedgeTicket ตอนนี้คือ Order Ticket ที่สร้าง Position นั้น
+              {
+               // เราต้อง Select Position ด้วย Ticket ที่ได้จาก CTrade.ResultOrder() หรือ CTrade.ResultDeal()
+               // ซึ่ง ExecuteHedgeTrade ควรจะคืน Position Ticket ถ้าเปิดสำเร็จ
+               // หรือเราอาจจะต้องปรับ ExecuteHedgeTrade ให้คืน Deal Ticket แล้วเราใช้ Deal Ticket หา Position Ticket
+               // เพื่อความง่าย ถ้า ExecuteHedgeTrade คืน Order Ticket ที่สัมพันธ์กับ Position ก็ใช้ได้
+
+               // หรือดีกว่าคือ ให้ ExecuteHedgeTrade คืน Deal Ticket แล้วเราหา Position Ticket จาก Deal นั้น
+               // หรือหลัง trade.Buy/Sell ให้เช็ค trade.ResultPositionID() (ถ้ามีในเวอร์ชัน CTrade ที่คุณใช้)
+               // สมมติว่า hedgeTicket ที่ได้มาคือ Position Ticket ที่ถูกต้องแล้ว
+               if(position.SelectByTicket(hedgeTicket))   // เลือก Position ของ Hedge ที่เพิ่งเปิด
+                 {
+                  cycle.hedge_trade.ticket      = hedgeTicket; // เก็บ Position Ticket
+                  cycle.hedge_trade.type        = (ENUM_ORDER_TYPE)position.PositionType();
+                  cycle.hedge_trade.open_price  = position.PriceOpen();
+                  cycle.hedge_trade.initial_lot = position.Volume();
+                  cycle.hedge_trade.current_lot = position.Volume();
+                  cycle.hedge_trade.open_time   = (datetime)position.Time();
+                  PrintFormat("Hedge Trade info (Pos #%lu) updated in cycle: Type %s, Price %.5f, Lot %.2f",
+                              cycle.hedge_trade.ticket, EnumToString(cycle.hedge_trade.type),
+                              cycle.hedge_trade.open_price, cycle.hedge_trade.initial_lot);
+
+                  if(g_use_counter_hedge)
+                    {
+                     ulong pendingTicket = PlaceCounterHedgePendingOrder(cycle); // ใช้ CTrade
+                     if(pendingTicket > 0)
+                        cycle.counter_hedge_pending_ticket = pendingTicket;
+                     else
+                        PrintFormat("ManageCycle: Failed to place Counter-Hedge pending order for cycle ID %s.", cycle.id);
+                    }
+                  cycle.status = CYCLE_HEDGED;
+                  cycle.current_basket_dominant_direction = cycle.hedge_trade.type;
+                  cycle.current_basket_dominant_lot = cycle.hedge_trade.initial_lot;
+                  RecalculateAndSetBasketSLTP_ForHedgedPair(cycle);
+                  PrintFormat("ManageCycle: Cycle ID %s HEDGED. Hedge Pos: #%lu. PendingCNTR: #%lu. Status: %s",
+                              cycle.id, cycle.hedge_trade.ticket, cycle.counter_hedge_pending_ticket, EnumToString(cycle.status));
+                 }
+               else
+                 {
+                  PrintFormat("ERROR ManageCycle: Could not select Hedge Position from Ticket #%lu after opening. Resetting cycle.", hedgeTicket);
+                  ResetTradeCycle(cycle);
+                  return;
+                 }
+              }
+            else
+              {
+               PrintFormat("ManageCycle: Failed to execute Hedge trade for cycle ID %s.", cycle.id);
+              }
+           }
+         break;
+        }
+
+      case CYCLE_HEDGED:
+        {
+         if(cycle.hedge_trade.ticket == 0)   // ตรวจสอบว่ามี Hedge Trade จริงๆ
+           {
+            PrintFormat("ERROR ManageCycle (HEDGED): Hedge trade data missing for Cycle ID %s. Resetting.", cycle.id);
+            ResetTradeCycle(cycle);
+            return;
+           }
+
+         bool counter_hedge_was_triggered_this_tick = false;
+         // ... (ส่วนโค้ดตรวจสอบ Counter-Hedge Trigger เหมือนเดิมที่เราทำไปสมบูรณ์แล้ว) ...
+         if(g_use_counter_hedge && cycle.counter_hedge_pending_ticket != 0 && cycle.counter_hedge_filled_trade.ticket == 0)
+           {
+            for(int i = PositionsTotal() - 1; i >= 0; i--)
+              {
+               if(position.SelectByIndex(i) && position.Magic() == g_magic_number && position.Symbol() == _Symbol &&
+                  position.Identifier() == cycle.counter_hedge_pending_ticket)
+                 {
+                  counter_hedge_was_triggered_this_tick = true;
+                  cycle.counter_hedge_filled_trade.ticket      = position.Ticket();
+                  cycle.counter_hedge_filled_trade.type        = (ENUM_ORDER_TYPE)position.PositionType();
+                  cycle.counter_hedge_filled_trade.open_price  = position.PriceOpen();
+                  cycle.counter_hedge_filled_trade.initial_lot = position.Volume();
+                  cycle.counter_hedge_filled_trade.current_lot = position.Volume();
+                  cycle.counter_hedge_filled_trade.open_time   = (datetime)position.Time();
+                  PrintFormat("ManageCycle: Counter-Hedge #%lu for Cycle %s TRIGGERED! New Pos Ticket: #%lu",
+                              cycle.counter_hedge_pending_ticket, cycle.id, cycle.counter_hedge_filled_trade.ticket);
+                  cycle.counter_hedge_pending_ticket = 0;
+                  break;
+                 }
+              }
+           }
+
+
+         if(counter_hedge_was_triggered_this_tick)
+           {
+            // --- ดำเนินการหลัง Counter-Hedge ถูก Trigger ---
+            PrintFormat("ManageCycle: Processing Triggered Counter-Hedge for Cycle %s", cycle.id);
+            if(position.SelectByTicket(cycle.initial_trade.ticket) && (position.StopLoss()!=0 || position.TakeProfit()!=0))
+               trade.PositionModify(cycle.initial_trade.ticket, 0, 0);
+            if(position.SelectByTicket(cycle.hedge_trade.ticket) && (position.StopLoss()!=0 || position.TakeProfit()!=0))
+               trade.PositionModify(cycle.hedge_trade.ticket, 0, 0);
+
+            cycle.status = CYCLE_COUNTER_HEDGED;
+            // Dominant direction/lot จะถูกคำนวณใหม่ใน RecalculateAndSetBasketSLTP_ForMultiOrderBasket
+            RecalculateAndSetBasketSLTP_ForMultiOrderBasket(cycle);
+            PrintFormat("ManageCycle: Cycle %s is now COUNTER_HEDGED. Basket TP Recalculated.", cycle.id);
+           }
+         // --- ถ้า Counter-Hedge ยังไม่ถูก Trigger และยังไม่มีการ Filled Counter Hedge trade ---
+         // --- และเปิดใช้งาน DCA ---
+         else
+            if(g_use_dca && cycle.counter_hedge_filled_trade.ticket == 0)  // ตรวจสอบว่ายังไม่มี Counter Hedge ที่ Filled
+              {
+               // พิจารณา DCA สำหรับฝั่ง Hedge (Dominant Side ปัจจุบันคือ Hedge)
+               // ทิศทาง DCA จะเป็นทิศทางเดียวกับ Hedge Order
+               if(ShouldEnterDCA(cycle, currentBias, cycle.hedge_trade.type))
+                 {
+                  if(PerformOverallMarginCheck())
+                    {
+                     double dcaLot = CalculateDCALot(cycle, cycle.hedge_trade.type);
+                     if(dcaLot > 0)
+                       {
+                        ulong dcaTicket = ExecuteDCATrade(cycle, dcaLot, cycle.hedge_trade.type);
+                        if(dcaTicket > 0)
+                          {
+                           int dcaIndex = ArraySize(cycle.dca_trades);
+                           ArrayResize(cycle.dca_trades, dcaIndex + 1);
+                           if(position.SelectByTicket(dcaTicket))
+                             {
+                              cycle.dca_trades[dcaIndex].ticket = dcaTicket;
+                              cycle.dca_trades[dcaIndex].type = (ENUM_ORDER_TYPE)position.PositionType();
+                              cycle.dca_trades[dcaIndex].open_price = position.PriceOpen();
+                              cycle.dca_trades[dcaIndex].initial_lot = position.Volume();
+                              cycle.dca_trades[dcaIndex].current_lot = position.Volume();
+                              cycle.dca_trades[dcaIndex].open_time = (datetime)position.Time();
+                              PrintFormat("ManageCycle: DCA Trade #%d for Hedge side (Ticket #%lu) info stored in Cycle %s.",
+                                          cycle.dca_count + 1, dcaTicket, cycle.id);
+                             }
+                           else
+                             {
+                              PrintFormat("ERROR ManageCycle: Could not select DCA Position #%lu (Hedge Side) after opening for cycle %s. DCA entry possibly failed or data lost.", dcaTicket, cycle.id);
+                              ArrayResize(cycle.dca_trades, dcaIndex); // Rollback array resize if position not found
+                              break; // ออกจาก case นี้ก่อน อาจจะลองใหม่ Tick หน้า
+                             }
+                           cycle.dca_count++;
+                           cycle.status = CYCLE_IN_DCA;
+                           RecalculateAndSetBasketSLTP_ForMultiOrderBasket(cycle);
+                           PrintFormat("ManageCycle: DCA for Hedge side executed in Cycle %s. DCA Count: %d. Basket TP Recalculated.", cycle.id, cycle.dca_count);
+                          }
+                       }
+                     else
+                       {
+                        PrintFormat("ManageCycle: Calculated DCA Lot for Hedge side in Cycle %s is zero or invalid.", cycle.id);
+                       }
+                    }
+                  else
+                    {
+                     PrintFormat("ManageCycle: Margin Check FAILED for DCA (Hedge side) in Cycle %s.", cycle.id);
+                    }
+                 }
+              }
+         break;
+        }
+
+      case CYCLE_COUNTER_HEDGED: // หลังจาก Counter-Hedge (ไม้ที่ 3) เปิดแล้ว, Dominant Side คือ Initial + Counter-Hedge
+      case CYCLE_IN_DCA:         // หรือเมื่ออยู่ในโหมด DCA แล้ว
+        {
+         if(cycle.status == CYCLE_COUNTER_HEDGED)
+           {
+            PrintFormat("DEBUG ManageCycle: Status COUNTER_HEDGED. Cycle ID %s. Dominant: %s (Current Calc Lot: %.2f)",
+                        cycle.id, EnumToString(cycle.current_basket_dominant_direction), cycle.current_basket_dominant_lot);
+           }
+         else     // CYCLE_IN_DCA
+           {
+            PrintFormat("DEBUG ManageCycle: Status IN_DCA. Cycle ID %s. DCA Count: %d. Dominant: %s (Current Calc Lot: %.2f)",
+                        cycle.id, cycle.dca_count, EnumToString(cycle.current_basket_dominant_direction), cycle.current_basket_dominant_lot);
+           }
+
+         if(g_use_dca && cycle.dca_count < g_max_dca_trades)
+           {
+            // ทิศทาง DCA จะเป็น current_basket_dominant_direction เสมอในสถานะเหล่านี้
+            if(cycle.current_basket_dominant_direction != WRONG_VALUE)
+              {
+               if(ShouldEnterDCA(cycle, currentBias, cycle.current_basket_dominant_direction))
+                 {
+                  if(PerformOverallMarginCheck())
+                    {
+                     double dcaLot = CalculateDCALot(cycle, cycle.current_basket_dominant_direction);
+                     if(dcaLot > 0)
+                       {
+                        ulong dcaTicket = ExecuteDCATrade(cycle, dcaLot, cycle.current_basket_dominant_direction);
+                        if(dcaTicket > 0)
+                          {
+                           int dcaIndex = ArraySize(cycle.dca_trades);
+                           ArrayResize(cycle.dca_trades, dcaIndex + 1);
+                           if(position.SelectByTicket(dcaTicket))
+                             {
+                              cycle.dca_trades[dcaIndex].ticket = dcaTicket;
+                              cycle.dca_trades[dcaIndex].type = (ENUM_ORDER_TYPE)position.PositionType();
+                              cycle.dca_trades[dcaIndex].open_price = position.PriceOpen();
+                              cycle.dca_trades[dcaIndex].initial_lot = position.Volume();
+                              cycle.dca_trades[dcaIndex].current_lot = position.Volume();
+                              cycle.dca_trades[dcaIndex].open_time = (datetime)position.Time();
+                              PrintFormat("ManageCycle: DCA Trade #%d for Dominant side (%s, Ticket #%lu) info stored in Cycle %s.",
+                                          cycle.dca_count + 1, EnumToString(cycle.current_basket_dominant_direction), dcaTicket, cycle.id);
+                             }
+                           else
+                             {
+                              PrintFormat("ERROR ManageCycle: Could not select DCA Position #%lu (Dominant Side) after opening for cycle %s.", dcaTicket, cycle.id);
+                              ArrayResize(cycle.dca_trades, dcaIndex);
+                              break;
+                             }
+                           cycle.dca_count++;
+                           cycle.status = CYCLE_IN_DCA; // Ensure status is IN_DCA
+                           RecalculateAndSetBasketSLTP_ForMultiOrderBasket(cycle);
+                           PrintFormat("ManageCycle: DCA for Dominant side (%s) in Cycle %s. New DCA Count: %d. Basket TP Recalculated.",
+                                       EnumToString(cycle.current_basket_dominant_direction), cycle.id, cycle.dca_count);
+                          }
+                       }
+                     else
+                       {
+                        PrintFormat("ManageCycle: Calculated DCA Lot for Dominant side in Cycle %s is zero or invalid.", cycle.id);
+                       }
+                    }
+                  else
+                    {
+                     PrintFormat("ManageCycle: Margin Check FAILED for DCA (Dominant side) in Cycle %s.", cycle.id);
+                    }
+                 }
+              }
+            else
+              {
+               PrintFormat("ManageCycle: Dominant direction is WRONG_VALUE for cycle %s after Counter-Hedge/DCA. Cannot determine further DCA.", cycle.id);
+              }
+           }
+         else
+            if(cycle.dca_count >= g_max_dca_trades)
+              {
+               PrintFormat("ManageCycle: Max DCA trades (%d) reached for Cycle ID %s. Holding.", g_max_dca_trades, cycle.id);
+              }
+         break;
+        }
+      default:
+         PrintFormat("ERROR ManageCycle: Unknown or unexpected cycle status (%s) for active cycle ID %s. Resetting.",
+                     EnumToString(cycle.status), cycle.id);
+         ResetTradeCycle(cycle);
+         break;
+     }
+   if(cycle.is_active && cycle.status != CYCLE_EMPTY) // ตรวจสอบอีกครั้งว่า Cycle ยัง Active
+     {
+      TrailAllOrdersWhenProfitTargetReached(cycle);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| (STUB) Resets the global trade cycle to empty state.             |
+//+------------------------------------------------------------------+
+void ResetTradeCycle(TradeCycle &cycle) // ส่งแบบ Reference เพื่อแก้ไขตัว Global โดยตรง
+  {
+   cycle.is_active = false;
+   cycle.status = CYCLE_EMPTY;
+   cycle.id = "";
+   cycle.initial_trade.ticket = 0;
+   cycle.hedge_trade.ticket = 0;
+   cycle.counter_hedge_pending_ticket = 0;
+   cycle.counter_hedge_filled_trade.ticket = 0;
+   ArrayResize(cycle.dca_trades, 0);
+   cycle.dca_count = 0;
+   cycle.calculated_basket_target_price = 0;
+// ไม่ต้อง Reset g_current_bias_status ที่นี่ เพราะเป็น Global state ของตลาด
+   Print("Trade Cycle has been reset.");
+  }
+
+
+
+
+//+------------------------------------------------------------------+
+//| Checks if hedging condition is met for the initial trade.        |
+//+------------------------------------------------------------------+
+bool ShouldHedge(TradeInCycle &initialTrade, ENUM_BIAS_STATUS currentBias)
+  {
+   if(!g_use_hedging)
+      return false;
+
+   bool biasOpposesTrade = false;
+   double priceMovementAgainstPips = 0;
+   double currentPriceForCheck = 0;
+
+   if(initialTrade.type == ORDER_TYPE_BUY)
+     {
+      // สัญญาณ Bias ที่ขัดแย้งกับ Buy Order
+      if(currentBias == SIGNAL_REVERSAL_DOWN_M5 ||
+         currentBias == SIGNAL_REVERSAL_DOWN_M15 ||
+         currentBias == SIGNAL_OVB_H1 || // Overbought อาจเป็นสัญญาณเตือนให้ Hedge Buy
+         currentBias == BIAS_D1_BEARISH_STRONG ||
+         currentBias == BIAS_D1_BEARISH_MODERATE) // Daily bias ขัดแย้ง
+        {
+         biasOpposesTrade = true;
+        }
+      currentPriceForCheck = g_symbolInfo.Bid();
+      priceMovementAgainstPips = (initialTrade.open_price - currentPriceForCheck) / g_symbolInfo.Point();
+     }
+   else
+      if(initialTrade.type == ORDER_TYPE_SELL)
+        {
+         // สัญญาณ Bias ที่ขัดแย้งกับ Sell Order
+         if(currentBias == SIGNAL_REVERSAL_UP_M5 ||
+            currentBias == SIGNAL_REVERSAL_UP_M15 ||
+            currentBias == SIGNAL_OVS_H1 || // Oversold อาจเป็นสัญญาณเตือนให้ Hedge Sell
+            currentBias == BIAS_D1_BULLISH_STRONG ||
+            currentBias == BIAS_D1_BULLISH_MODERATE)
+           {
+            biasOpposesTrade = true;
+           }
+         currentPriceForCheck = g_symbolInfo.Ask();
+         priceMovementAgainstPips = (currentPriceForCheck - initialTrade.open_price) / g_symbolInfo.Point();
+        }
+
+   if(biasOpposesTrade)
+     {
+      // ตรวจสอบว่าราคาวิ่งสวนทางมาพอสมควรหรือไม่ (เช่น ใช้ InpDCAStepPipsOrSignal เป็นเกณฑ์ชั่วคราว)
+      // หรือจะใช้ InpHedgeTriggerPipsAgainst ที่อาจจะเพิ่มเข้าไปใหม่
+      if(priceMovementAgainstPips >= g_dca_step_pips_or_signal) // หรือ >= InpHedgeTriggerPipsAgainst
+        {
+         PrintFormat("ShouldHedge: YES. Initial: %s @ %.5f, Bias: %s, Price moved against by %.1f pips (Threshold: %.1f)",
+                     EnumToString(initialTrade.type), initialTrade.open_price,
+                     EnumToString(currentBias), priceMovementAgainstPips, g_dca_step_pips_or_signal);
+         return true;
+        }
+      else
+        {
+         // PrintFormat("ShouldHedge: Bias opposes but price movement (%.1f pips) < threshold (%.1f pips)",
+         //            priceMovementAgainstPips, g_dca_step_pips_or_signal);
+        }
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Executes a hedge trade using CTrade and updates the cycle.       |
+//+------------------------------------------------------------------+
+ulong ExecuteHedgeTrade(TradeCycle &cycle, ENUM_ORDER_TYPE hedgeOrderType, double hedgeMarketPrice, double hedgeLot)
+  {
+// ไม่ต้อง ZeroMemory MqlTradeRequest/Result เอง เพราะ CTrade จัดการภายใน
+// ไม่ต้อง Set action, symbol, magic, deviation, type_filling เอง ถ้า Set ไว้ที่ CTrade object แล้ว
+
+   string comment = g_comment_prefix + "HEDGE_for_" + cycle.id;
+   bool success = false;
+
+   if(hedgeOrderType == ORDER_TYPE_BUY)
+     {
+      // ราคา price ที่ส่งให้ CTrade::Buy ควรจะเป็นราคา Ask หรือ 0.0 (เพื่อให้ CTrade ดึงราคาตลาดให้)
+      // SL/TP เป็น 0 เพราะเราจะจัดการแบบ Basket
+      success = trade.Buy(hedgeLot, _Symbol, hedgeMarketPrice, 0.0, 0.0, comment);
+     }
+   else
+      if(hedgeOrderType == ORDER_TYPE_SELL)
+        {
+         // ราคา price ที่ส่งให้ CTrade::Sell ควรจะเป็นราคา Bid หรือ 0.0
+         success = trade.Sell(hedgeLot, _Symbol, hedgeMarketPrice, 0.0, 0.0, comment);
+        }
+
+   if(success)
+     {
+      PrintFormat("CTrade: Hedge Trade Sent: %s for Cycle %s, Lot: %.2f, ApproxPrice: %.5f. Result Retcode: %d, Order Ticket: %lu",
+                  EnumToString(hedgeOrderType), cycle.id, hedgeLot, hedgeMarketPrice, trade.ResultRetcode(), trade.ResultOrder());
+      // CTrade.ResultOrder() จะคืน Ticket ของ Order ที่ถูกสร้าง (ถ้าเป็น Market Order ก็จะกลายเป็น Deal และ Position ทันที)
+      // หรือ Ticket ของ Pending Order (ถ้าใช้ OrderOpen)
+      // สำหรับ PositionOpen/Buy/Sell, CTrade.ResultDeal() จะมี Deal Ticket และ CTrade.ResultOrder() คือ Order Ticket ที่สร้าง Position นั้น
+      return trade.ResultOrder(); // หรือ trade.ResultDeal() ถ้าต้องการ Deal ID ที่สัมพันธ์กับ Position
+     }
+   else
+     {
+      PrintFormat("CTrade: Hedge Trade FAILED for Cycle %s. Retcode: %d, Broker Comment: %s, Last Error: %d",
+                  cycle.id, trade.ResultRetcode(), trade.ResultComment(), GetLastError());
+     }
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| Places a counter-hedge pending order using CTrade.               |
+//+------------------------------------------------------------------+
+ulong PlaceCounterHedgePendingOrder(TradeCycle &cycle)
+  {
+   if(!g_use_counter_hedge || cycle.initial_trade.ticket == 0 || cycle.hedge_trade.ticket == 0)
+      return 0;
+
+   ENUM_ORDER_TYPE counterHedgeOrderTypeDirection = cycle.initial_trade.type; // ทิศทางเดียวกับไม้แรก
+   double counterHedgeEntryPrice = cycle.initial_trade.open_price;
+   double counterHedgeLot = CalculateCounterHedgeLot(cycle.initial_trade.initial_lot, cycle.hedge_trade.initial_lot);
+
+   if(counterHedgeLot <= 0)
+     {
+      PrintFormat("PlaceCounterHedgePendingOrder: Invalid Counter Hedge Lot (%.2f) for Cycle %s.", counterHedgeLot, cycle.id);
+      return 0;
+     }
+
+   string comment = g_comment_prefix + "CNTR_HEDGE_for_" + cycle.id;
+   bool success = false;
+   ENUM_ORDER_TYPE pending_order_type = WRONG_VALUE;
+
+   if(counterHedgeOrderTypeDirection == ORDER_TYPE_BUY)
+     {
+      pending_order_type = ORDER_TYPE_BUY_STOP;
+      // CTrade::BuyStop(volume, price, symbol, sl, tp, time_type, expiration, comment)
+      success = trade.BuyStop(counterHedgeLot, counterHedgeEntryPrice, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, comment);
+     }
+   else
+      if(counterHedgeOrderTypeDirection == ORDER_TYPE_SELL)
+        {
+         pending_order_type = ORDER_TYPE_SELL_STOP;
+         success = trade.SellStop(counterHedgeLot, counterHedgeEntryPrice, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, comment);
+        }
+      else
+        {
+         PrintFormat("PlaceCounterHedgePendingOrder: Invalid direction for Counter Hedge in Cycle %s.", cycle.id);
+         return 0;
+        }
+
+   if(success)
+     {
+      PrintFormat("CTrade: Counter-Hedge Pending Order Placed: %s for Cycle %s, Ticket: #%lu, Lot: %.2f, Price: %.5f. Retcode: %d",
+                  EnumToString(pending_order_type), cycle.id, trade.ResultOrder(), counterHedgeLot, counterHedgeEntryPrice, trade.ResultRetcode());
+      return trade.ResultOrder(); // CTrade.ResultOrder() จะคืน Ticket ของ Pending Order ที่เพิ่งวาง
+     }
+   else
+     {
+      PrintFormat("CTrade: Counter-Hedge Pending Order FAILED for Cycle %s. Retcode: %d, Broker Comment: %s, Last Error: %d",
+                  cycle.id, trade.ResultRetcode(), trade.ResultComment(), GetLastError());
+     }
+   return 0;
+  }
+
+
+//+------------------------------------------------------------------+
+//| Initializes a new trade cycle after an initial trade.            |
+//+------------------------------------------------------------------+
+void InitializeNewTradeCycle(ulong initialTicket, ENUM_ORDER_TYPE type, double openPrice, double lotSize)
+  {
+   g_current_trade_cycle.is_active = true;
+   g_current_trade_cycle.status = CYCLE_INITIAL_TRADE_OPEN;
+// แปลง ulong initialTicket เป็น long ก่อน แล้วจึงแปลงเป็น string
+   g_current_trade_cycle.id = IntegerToString((long)initialTicket); // <--- แก้ไขตรงนี้
+
+   g_current_trade_cycle.initial_trade.ticket = initialTicket;
+   g_current_trade_cycle.initial_trade.type = type;
+   g_current_trade_cycle.initial_trade.open_price = openPrice;
+   g_current_trade_cycle.initial_trade.initial_lot = lotSize;
+   g_current_trade_cycle.initial_trade.current_lot = lotSize;
+   g_current_trade_cycle.initial_trade.open_time = TimeCurrent();
+
+// Reset other parts of the cycle
+   g_current_trade_cycle.hedge_trade.ticket = 0;
+   g_current_trade_cycle.counter_hedge_pending_ticket = 0;
+   g_current_trade_cycle.counter_hedge_filled_trade.ticket = 0;
+   ArrayResize(g_current_trade_cycle.dca_trades, 0);
+   g_current_trade_cycle.dca_count = 0;
+   g_current_trade_cycle.calculated_basket_target_price = 0;
+   g_current_trade_cycle.current_basket_dominant_direction = type;
+   g_current_trade_cycle.current_basket_dominant_lot = lotSize;
+
+   PrintFormat("New Trade Cycle Initialized. ID: %s, Type: %s, Lot: %.2f, Price: %.5f",
+               g_current_trade_cycle.id, EnumToString(type), lotSize, openPrice);
+  }
+
+//+------------------------------------------------------------------+
+//| Looks for and opens a new initial trade.                         |
+//+------------------------------------------------------------------+
+void LookForAndOpenInitialTrade(ENUM_BIAS_STATUS currentBias)
+  {
+   if(g_current_trade_cycle.is_active)  // ถ้ามี Cycle เดิมที่ยังจัดการไม่จบ จะไม่เปิดใหม่
+      return;
+
+   if(!InpEnableInitialEntryLogic)
+      return;
+
+// --- ดึงสัญญาณ M5 ---
+   InitialTradeSignalDetails signal = GetM5InitialEntrySignal(currentBias);
+
+   if(signal.isValid)
+     {
+      // --- ตรวจสอบ Margin ก่อนเปิดออเดอร์ ---
+      if(!PerformOverallMarginCheck())
+         return;
+
+      // --- คำนวณ Lot Size ---
+      // ในเวอร์ชันนี้ เราจะใช้ Fixed Lot จาก Input ก่อนเพื่อความง่าย
+      double lotSize = g_initial_lot_size;
+      lotSize = NormalizeDouble(MathRound(lotSize / g_symbolInfo.LotsStep()) * g_symbolInfo.LotsStep(), GetLotStepDigits(g_symbolInfo.LotsStep()));
+      if(lotSize < g_symbolInfo.LotsMin())
+         lotSize = g_symbolInfo.LotsMin();
+      if(lotSize > g_symbolInfo.LotsMax())
+         lotSize = g_symbolInfo.LotsMax();
+
+
+      // --- สร้างคำสั่งซื้อขาย ---
+      MqlTradeRequest request;
+      MqlTradeResult  result;
+      ZeroMemory(request);
+      ZeroMemory(result);
+
+      request.action   = TRADE_ACTION_DEAL;
+      request.symbol   = _Symbol;
+      request.volume   = lotSize;
+      request.magic    = g_magic_number;
+      request.comment  = g_comment_prefix + signal.signalDescription;
+      request.type     = signal.orderType;
+      request.price    = SymbolInfoDouble(_Symbol, (signal.orderType == ORDER_TYPE_BUY) ? SYMBOL_ASK : SYMBOL_BID); // ใช้ราคาตลาดปัจจุบัน
+      request.sl       = 0; // ไม่มี SL รายตัว
+      request.tp       = 0; // ไม่มี TP รายตัว (จะจัดการแบบ Basket)
+      request.deviation= (ulong)InpSlippagePoints; // Slippage เป็น ulong
+      request.type_time = ORDER_TIME_GTC;
+      request.type_filling = ORDER_FILLING_IOC;
+      // --- ส่งคำสั่ง ---
+      if(trade.OrderSend(request,result))
+        {
+         if(result.retcode==TRADE_RETCODE_DONE || result.retcode==TRADE_RETCODE_PLACED)
+           {
+            PrintFormat("Initial Trade Opened: %s, Ticket: %lu, Lot: %.2f, Price: %.5f, Signal: %s",
+                        EnumToString(signal.orderType), result.order, lotSize, result.price, signal.signalDescription);
+            InitializeNewTradeCycle(result.order, signal.orderType, result.price, lotSize);
+           }
+         else
+           {
+            PrintFormat("Initial Trade Open FAILED. Retcode: %d, Broker Comment: %s, EA Comment: %s", result.retcode, result.comment, request.comment);
+           }
+        }
+      else
+        {
+         PrintFormat("OrderSend FAILED for Initial Trade. Error: %d. Request Price: %.5f", GetLastError(), request.price);
+        }
+     }
+  }
+
+
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+void OnTick()
+  {
+   ZigZagOnChart();
+
+   TrailAllOrdersWhenProfitTargetReached();
+
+
+// 2. คำนวณ Bias
+   g_current_bias_status = CalculateMultiTimeframeEmaBias();
+
+// 3. Print Debug ทุก M5
+   static datetime last_debug_print_time = 0;
+   if(TimeCurrent() - last_debug_print_time >= PeriodSeconds(PERIOD_M5) || last_debug_print_time == 0)
+     {
+      PrintFormat("%s - Current Bias: %s",
+                  TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES | TIME_SECONDS),
+                  EnumToString(g_current_bias_status));
+      last_debug_print_time = TimeCurrent();
+     }
+
+// 4. วัด Tick Volume M5 ล่าสุด
+   long curvol = iVolume(_Symbol, PERIOD_M5, 0);
+
+// 5. ดำเนินการจัดการออเดอร์หรือหาโอกาสเข้าใหม่
+   if(g_current_trade_cycle.is_active)
+     {
+      ManageSingleTradeCycle(g_current_trade_cycle, g_current_bias_status);
+     }
+   else
+     {
+      static datetime lastM5BarTimeToOpenTrade = 0;
+      datetime currentM5BarTime = (datetime)SeriesInfoInteger(_Symbol, PERIOD_M5, SERIES_LASTBAR_DATE);
+
+      // ทำงานเมื่อแท่ง M5 ใหม่เริ่มขึ้น
+      if(currentM5BarTime > lastM5BarTimeToOpenTrade)
+        {
+         lastM5BarTimeToOpenTrade = currentM5BarTime;
+
+         if(g_current_bias_status == BIAS_BULLISH_STRONG || g_current_bias_status == BIAS_BULLISH_VERY_STRONG)
+           {
+            STrategy_Buy();
+           }
+
+         if(g_current_bias_status == BIAS_BEARISH_STRONG || g_current_bias_status == BIAS_BEARISH_VERY_STRONG)
+           {
+            STrategy_Sell();
+           }
+        }
+     }
+
+// 6. แสดงสถานะหลักในหน้าต่าง chart
+   Comment(StringFormat("Bias: %s\nMacdBuy: %s\nMacdSell: %s\nVol: %d",
+                        EnumToString(g_current_bias_status),
+                        (macd_crossover(1) ? "true" : "false"),
+                        (macd_crossover(-1) ? "true" : "false"),
+                        curvol));
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Calculates the lot size for a hedge trade.                       |
+//+------------------------------------------------------------------+
+double CalculateHedgeLot(double initialLot)
+  {
+   if(!g_use_hedging || g_hedge_lot_multiplier <= 0)
+      return 0; // Hedging not enabled or invalid multiplier
+
+   double hedgeLot = initialLot * g_hedge_lot_multiplier;
+
+// Normalize lot size (ฟังก์ชันนี้เราอาจจะต้องสร้างแยก หรือใช้ที่มีใน CTrade ถ้ามี)
+   double minLot = g_symbolInfo.LotsMin();
+   double maxLot = g_symbolInfo.LotsMax();
+   double lotStep = g_symbolInfo.LotsStep();
+
+   if(lotStep <= 0)
+      lotStep = 0.01; // Fallback if lot step is zero
+
+   hedgeLot = MathRound(hedgeLot / lotStep) * lotStep; // ปรับให้เป็นทวีคูณของ Lot Step
+
+   if(hedgeLot < minLot)
+      hedgeLot = minLot;
+   if(hedgeLot > maxLot)
+      hedgeLot = maxLot;
+
+   return NormalizeDouble(hedgeLot, GetLotStepDigits(lotStep));
+  }
+//+------------------------------------------------------------------+
+//| Calculates the lot size for a counter-hedge trade (Order 3).   |
+//+------------------------------------------------------------------+
+double CalculateCounterHedgeLot(double initialLotL1, double hedgeLotL2)
+  {
+   if(!g_use_counter_hedge || hedgeLotL2 <= 0 || initialLotL1 <=0)
+      return 0; // Counter-hedging not enabled or invalid input lots
+
+// Option 2: Aim for (L1 + L3) to be slightly greater than L2
+// L1 + L3 = L2 + LotStep  => L3 = L2 - L1 + LotStep
+   double lotStep = g_symbolInfo.LotsStep();
+   if(lotStep <= 0)
+      lotStep = 0.01; // Fallback
+
+   double counterHedgeLot = hedgeLotL2 - initialLotL1 + lotStep;
+
+// Ensure L3 is at least minLot if L2-L1 is very small or negative (should not happen if L2 > L1)
+   if(counterHedgeLot < lotStep)
+      counterHedgeLot = lotStep; // L3 อย่างน้อยต้องเท่ากับ lotStep
+
+// Normalize lot size
+   double minLot = g_symbolInfo.LotsMin();
+   double maxLot = g_symbolInfo.LotsMax();
+
+   counterHedgeLot = MathRound(counterHedgeLot / lotStep) * lotStep;
+
+   if(counterHedgeLot < minLot)
+      counterHedgeLot = minLot;
+   if(counterHedgeLot > maxLot)
+      counterHedgeLot = maxLot;
+
+   return NormalizeDouble(counterHedgeLot, GetLotStepDigits(lotStep));
+  }
+//+------------------------------------------------------------------+
+//| Recalculates and sets SL/TP for a 2-order basket (Initial + Hedge).|
+//| Assumes the basket should profit if price moves in Hedge direction.|
+//+------------------------------------------------------------------+
+void RecalculateAndSetBasketSLTP_ForHedgedPair(TradeCycle &cycle)
+  {
+   if(!cycle.is_active || cycle.status != CYCLE_HEDGED ||
+      cycle.initial_trade.ticket == 0 || cycle.hedge_trade.ticket == 0 ||
+      cycle.initial_trade.initial_lot <=0 || cycle.hedge_trade.initial_lot <=0)  // เพิ่มการตรวจสอบ Lot
+     {
+      Print("RecalculateAndSetBasketSLTP_ForHedgedPair: Invalid cycle state, missing trades, or zero lot sizes.");
+      return;
+     }
+
+   double P1 = cycle.initial_trade.open_price;
+   double L1 = cycle.initial_trade.initial_lot;
+   ENUM_ORDER_TYPE type1 = cycle.initial_trade.type;
+
+   double P2 = cycle.hedge_trade.open_price;
+   double L2 = cycle.hedge_trade.initial_lot;
+   ENUM_ORDER_TYPE type2 = cycle.hedge_trade.type;
+
+   double gap = 0;
+   double distance_factor = 0;
+   double target_price_calculated = 0; // เปลี่ยนชื่อเพื่อไม่ให้สับสน
+
+   if(type1 == ORDER_TYPE_BUY && type2 == ORDER_TYPE_SELL)
+     {
+      if(P1 <= P2)
+        {
+         Print("Recalculate(HedgedPair): Hedge Sell price %.5f not below Initial Buy price %.5f.", P2, P1);
+         return;
+        }
+      gap = P1 - P2;
+      if(L1 == 0)
+        {
+         Print("Recalculate(HedgedPair): Initial Lot L1 is zero!");   // ป้องกันหารด้วยศูนย์
+         return;
+        }
+      distance_factor = gap * (L2 / L1);
+      target_price_calculated = P2 - distance_factor;
+      cycle.current_basket_dominant_direction = ORDER_TYPE_SELL;
+     }
+   else
+      if(type1 == ORDER_TYPE_SELL && type2 == ORDER_TYPE_BUY)
+        {
+         if(P1 >= P2)
+           {
+            Print("Recalculate(HedgedPair): Hedge Buy price %.5f not above Initial Sell price %.5f.", P2, P1);
+            return;
+           }
+         gap = P2 - P1;
+         if(L1 == 0)
+           {
+            Print("Recalculate(HedgedPair): Initial Lot L1 is zero!");   // ป้องกันหารด้วยศูนย์
+            return;
+           }
+         distance_factor = gap * (L2 / L1);
+         target_price_calculated = P2 + distance_factor;
+         cycle.current_basket_dominant_direction = ORDER_TYPE_BUY;
+        }
+      else
+        {
+         Print("Recalculate(HedgedPair): Mismatched order types for hedge pair.");
+         return;
+        }
+
+   if(target_price_calculated == 0 || !MathIsValidNumber(target_price_calculated))  // <--- แก้ไขตรงนี้
+     {
+      Print("Recalculate(HedgedPair): Calculated target price is zero or invalid. Aborting modification.");
+      return;
+     }
+   target_price_calculated = NormalizeDouble(target_price_calculated, (int)g_symbolInfo.Digits());
+   cycle.calculated_basket_target_price = target_price_calculated;
+   cycle.current_basket_dominant_lot = L2;
+
+   PrintFormat("RecalculateBasketSLTP (HedgedPair): TargetPrice=%.*f, DominantDir=%s, DominantLot=%.2f",
+               (int)g_symbolInfo.Digits(), target_price_calculated,
+               EnumToString(cycle.current_basket_dominant_direction), cycle.current_basket_dominant_lot);
+
+// --- Modify Orders ---
+// ดึงราคาตลาดปัจจุบันและ StopLevel
+   double currentBid = g_symbolInfo.Bid();
+   double currentAsk = g_symbolInfo.Ask();
+   double stopLevelPips = g_symbolInfo.StopsLevel(); // StopsLevel เป็น Points
+   double stopLevelPriceDistance = stopLevelPips * g_symbolInfo.Point();
+
+// Modify Initial Order (ตั้ง SL ไปที่ target_price, TP = 0 หรือไกลมาก)
+   if(position.SelectByTicket(cycle.initial_trade.ticket))
+     {
+      double new_sl_initial = target_price_calculated;
+      double new_tp_initial = 0; // เราไม่ใช้ TP รายตัวสำหรับ Basket นี้
+
+      bool can_modify_sl_initial = false;
+      if(type1 == ORDER_TYPE_BUY) // SL ของ Buy ต้องต่ำกว่า Bid ปัจจุบันอย่างน้อย StopLevel
+        {
+         if(new_sl_initial < currentBid - stopLevelPriceDistance)
+            can_modify_sl_initial = true;
+         else
+            PrintFormat("Cannot modify Initial Buy #%d SL to %.5f: Too close to current Bid %.5f (StopLevelDist %.5f)", cycle.initial_trade.ticket, new_sl_initial, currentBid, stopLevelPriceDistance);
+        }
+      else // ORDER_TYPE_SELL, SL ของ Sell ต้องสูงกว่า Ask ปัจจุบันอย่างน้อย StopLevel
+        {
+         if(new_sl_initial > currentAsk + stopLevelPriceDistance)
+            can_modify_sl_initial = true;
+         else
+            PrintFormat("Cannot modify Initial Sell #%d SL to %.5f: Too close to current Ask %.5f (StopLevelDist %.5f)", cycle.initial_trade.ticket, new_sl_initial, currentAsk, stopLevelPriceDistance);
+        }
+
+      if(can_modify_sl_initial)
+        {
+         if(trade.PositionModify(cycle.initial_trade.ticket, new_sl_initial, new_tp_initial))
+           {
+            PrintFormat("Modified Initial Order #%lu: SL=%.*f, TP=%.*f", cycle.initial_trade.ticket, (int)g_symbolInfo.Digits(), new_sl_initial, (int)g_symbolInfo.Digits(), new_tp_initial);
+           }
+         else
+           {
+            PrintFormat("Failed to modify Initial Order #%lu SL/TP. Error: %d", cycle.initial_trade.ticket, GetLastError());
+           }
+        }
+     }
+
+// Modify Hedge Order (ตั้ง TP ไปที่ target_price, SL = 0 หรือไกลมาก)
+   if(position.SelectByTicket(cycle.hedge_trade.ticket))
+     {
+      double new_tp_hedge = target_price_calculated;
+      double new_sl_hedge = 0; // เราไม่ใช้ SL รายตัวสำหรับ Basket นี้
+
+      bool can_modify_tp_hedge = false;
+      if(type2 == ORDER_TYPE_BUY) // TP ของ Buy ต้องสูงกว่า Ask ปัจจุบันอย่างน้อย StopLevel
+        {
+         if(new_tp_hedge > currentAsk + stopLevelPriceDistance)
+            can_modify_tp_hedge = true;
+         else
+            PrintFormat("Cannot modify Hedge Buy #%d TP to %.5f: Too close to current Ask %.5f (StopLevelDist %.5f)", cycle.hedge_trade.ticket, new_tp_hedge, currentAsk, stopLevelPriceDistance);
+        }
+      else // ORDER_TYPE_SELL, TP ของ Sell ต้องต่ำกว่า Bid ปัจจุบันอย่างน้อย StopLevel
+        {
+         if(new_tp_hedge < currentBid - stopLevelPriceDistance)
+            can_modify_tp_hedge = true;
+         else
+            PrintFormat("Cannot modify Hedge Sell #%d TP to %.5f: Too close to current Bid %.5f (StopLevelDist %.5f)", cycle.hedge_trade.ticket, new_tp_hedge, currentBid, stopLevelPriceDistance);
+        }
+
+      if(can_modify_tp_hedge)
+        {
+         if(trade.PositionModify(cycle.hedge_trade.ticket, new_sl_hedge, new_tp_hedge))
+           {
+            PrintFormat("Modified Hedge Order #%lu: SL=%.*f, TP=%.*f", cycle.hedge_trade.ticket, (int)g_symbolInfo.Digits(), new_sl_hedge, (int)g_symbolInfo.Digits(), new_tp_hedge);
+           }
+         else
+           {
+            PrintFormat("Failed to modify Hedge Order #%lu SL/TP. Error: %d", cycle.hedge_trade.ticket, GetLastError());
+           }
+        }
+     }
+  }
+// Input Parameter ที่อาจจะต้องเพิ่ม (ถ้ายังไม่ได้เพิ่มในส่วน Input ของ EA)
+// input group "Trade Exit & Targets"
+// input double InpMinBasketTargetProfitUSD = 0.1; // กำไร USD ขั้นต่ำที่ต้องการเมื่อปิดรวบยอด Basket
+
+// Global variable (ถ้าจะใช้ Input)
+// double g_min_basket_target_profit_usd;
+// ใน OnInit(): g_min_basket_target_profit_usd = InpMinBasketTargetProfitUSD;
+
+
+//+------------------------------------------------------------------+
+//| Recalculates and sets SL/TP for a multi-order basket.            |
+//+------------------------------------------------------------------+
+void RecalculateAndSetBasketSLTP_ForMultiOrderBasket(TradeCycle &cycle)
+  {
+   if(!cycle.is_active || cycle.initial_trade.ticket == 0) // อย่างน้อยต้องมี Initial Trade ถึงจะเริ่ม Cycle
+     {
+      PrintFormat("RecalculateMulti: Cycle ID %s not active or initial trade missing. Aborting.", cycle.id);
+      return;
+     }
+// ตรวจสอบสถานะของ Cycle ว่าเหมาะสมกับการคำนวณแบบ Multi-Order หรือไม่
+// ควรถูกเรียกเมื่อมีอย่างน้อย 2 ออเดอร์ที่ Active และสถานะไม่ใช่แค่ INITIAL_TRADE_OPEN (เว้นแต่ INITIAL + 1 DCA)
+// หรือเมื่อสถานะเป็น COUNTER_HEDGED หรือ IN_DCA
+   if(cycle.status == CYCLE_EMPTY || (cycle.status == CYCLE_INITIAL_TRADE_OPEN && cycle.dca_count == 0))
+     {
+      PrintFormat("RecalculateMulti: Cycle ID %s status (%s) not suitable for multi-order basket TP. Initial trades: %d, DCA: %d",
+                  cycle.id, EnumToString(cycle.status), (cycle.initial_trade.ticket > 0 ? 1:0), cycle.dca_count);
+      return;
+     }
+
+   PrintFormat("DEBUG: RecalculateAndSetBasketSLTP_ForMultiOrderBasket called for Cycle ID %s, Status: %s",
+               cycle.id, EnumToString(cycle.status));
+
+// --- 1. รวบรวมออเดอร์ทั้งหมดที่ยังเปิดอยู่ใน Cycle และคำนวณ Lot ปัจจุบัน ---
+   TradeInCycle active_trades_in_cycle[];
+   int total_active_trades = 0;
+   double totalBuyLot = 0;
+   double totalSellLot = 0;
+
+// Initial Trade
+   if(cycle.initial_trade.ticket != 0 && position.SelectByTicket(cycle.initial_trade.ticket))
+     {
+      ArrayResize(active_trades_in_cycle, total_active_trades + 1);
+      active_trades_in_cycle[total_active_trades] = cycle.initial_trade;
+      active_trades_in_cycle[total_active_trades].current_lot = position.Volume();
+      if(active_trades_in_cycle[total_active_trades].type == ORDER_TYPE_BUY)
+         totalBuyLot += active_trades_in_cycle[total_active_trades].current_lot;
+      else
+         if(active_trades_in_cycle[total_active_trades].type == ORDER_TYPE_SELL)
+            totalSellLot += active_trades_in_cycle[total_active_trades].current_lot;
+      total_active_trades++;
+     }
+   else
+     {
+      cycle.initial_trade.ticket = 0; // Mark as closed/invalid if not found by selection
+     }
+
+// Hedge Trade
+   if(cycle.hedge_trade.ticket != 0 && position.SelectByTicket(cycle.hedge_trade.ticket))
+     {
+      ArrayResize(active_trades_in_cycle, total_active_trades + 1);
+      active_trades_in_cycle[total_active_trades] = cycle.hedge_trade;
+      active_trades_in_cycle[total_active_trades].current_lot = position.Volume();
+      if(active_trades_in_cycle[total_active_trades].type == ORDER_TYPE_BUY)
+         totalBuyLot += active_trades_in_cycle[total_active_trades].current_lot;
+      else
+         if(active_trades_in_cycle[total_active_trades].type == ORDER_TYPE_SELL)
+            totalSellLot += active_trades_in_cycle[total_active_trades].current_lot;
+      total_active_trades++;
+     }
+   else
+     {
+      cycle.hedge_trade.ticket = 0;
+     }
+
+// Counter-Hedge Filled Trade
+   if(cycle.counter_hedge_filled_trade.ticket != 0 && position.SelectByTicket(cycle.counter_hedge_filled_trade.ticket))
+     {
+      ArrayResize(active_trades_in_cycle, total_active_trades + 1);
+      active_trades_in_cycle[total_active_trades] = cycle.counter_hedge_filled_trade;
+      active_trades_in_cycle[total_active_trades].current_lot = position.Volume();
+      if(active_trades_in_cycle[total_active_trades].type == ORDER_TYPE_BUY)
+         totalBuyLot += active_trades_in_cycle[total_active_trades].current_lot;
+      else
+         if(active_trades_in_cycle[total_active_trades].type == ORDER_TYPE_SELL)
+            totalSellLot += active_trades_in_cycle[total_active_trades].current_lot;
+      total_active_trades++;
+     }
+   else
+     {
+      cycle.counter_hedge_filled_trade.ticket = 0;
+     }
+
+// DCA Trades
+   for(int i = 0; i < ArraySize(cycle.dca_trades); i++)
+     {
+      if(cycle.dca_trades[i].ticket != 0 && position.SelectByTicket(cycle.dca_trades[i].ticket))
+        {
+         ArrayResize(active_trades_in_cycle, total_active_trades + 1);
+         active_trades_in_cycle[total_active_trades] = cycle.dca_trades[i];
+         active_trades_in_cycle[total_active_trades].current_lot = position.Volume();
+         if(active_trades_in_cycle[total_active_trades].type == ORDER_TYPE_BUY)
+            totalBuyLot += active_trades_in_cycle[total_active_trades].current_lot;
+         else
+            if(active_trades_in_cycle[total_active_trades].type == ORDER_TYPE_SELL)
+               totalSellLot += active_trades_in_cycle[total_active_trades].current_lot;
+         total_active_trades++;
+        }
+      else
+        {
+         if(ArraySize(cycle.dca_trades) > i)
+            cycle.dca_trades[i].ticket = 0;
+        }
+     }
+
+   if(total_active_trades == 0)
+     {
+      PrintFormat("RecalculateMulti: No active positions found for cycle ID %s after filtering. Resetting cycle.", cycle.id);
+      ResetTradeCycle(cycle);
+      return;
+     }
+   if(total_active_trades == 1 && cycle.status != CYCLE_INITIAL_TRADE_OPEN)
+     {
+      PrintFormat("RecalculateMulti: Only 1 active trade left in cycle ID %s (Status: %s). Specific handling might be needed or reset.", cycle.id, EnumToString(cycle.status));
+      // Potentially reset or handle as a single trade now, for now we return.
+      // If this single trade is the dominant one and profitable according to some rule, CheckAndCloseProfitableBasket should handle it.
+      // For now, avoid setting basket TP for a single remaining trade unless it's the initial state.
+      cycle.calculated_basket_target_price = 0;
+      return;
+     }
+   PrintFormat("RecalculateMulti: Cycle ID %s has %d active trades. TotalBuyLot: %.2f, TotalSellLot: %.2f",
+               cycle.id, total_active_trades, totalBuyLot, totalSellLot);
+
+
+// --- 2. อัปเดต Dominant Direction/Lot ใน Cycle (สำคัญมาก!) ---
+   double netLotExposure = NormalizeDouble(totalBuyLot - totalSellLot, 8);
+   double epsilon = 0.00000001;
+
+   if(MathAbs(netLotExposure) < g_symbolInfo.LotsStep() && MathAbs(netLotExposure) < epsilon)
+     {
+      PrintFormat("RecalculateMulti: Net lot exposure (%.8f) is effectively zero for cycle ID %s. Holding. (BuyLots: %.2f, SellLots: %.2f)",
+                  netLotExposure, cycle.id, totalBuyLot, totalSellLot);
+      cycle.calculated_basket_target_price = 0;
+      for(int i = 0; i < total_active_trades; i++)   // Attempt to clear SL/TP on perfect hedge
+        {
+         if(position.SelectByTicket(active_trades_in_cycle[i].ticket))
+           {
+            if(position.StopLoss() != 0 || position.TakeProfit() != 0)
+              {
+               trade.PositionModify(active_trades_in_cycle[i].ticket, 0, 0);
+              }
+           }
+        }
+      return;
+     }
+
+   if(netLotExposure > 0)
+     {
+      cycle.current_basket_dominant_direction = ORDER_TYPE_BUY;
+      cycle.current_basket_dominant_lot = totalBuyLot;
+     }
+   else
+     {
+      cycle.current_basket_dominant_direction = ORDER_TYPE_SELL;
+      cycle.current_basket_dominant_lot = totalSellLot;
+     }
+   PrintFormat("RecalculateMulti: Cycle ID %s, NetLot: %.2f, New DominantDir: %s, DominantTotalLot: %.2f, OpposingTotalLot: %.2f",
+               cycle.id, netLotExposure, EnumToString(cycle.current_basket_dominant_direction),
+               (cycle.current_basket_dominant_direction == ORDER_TYPE_BUY ? totalBuyLot : totalSellLot),
+               (cycle.current_basket_dominant_direction == ORDER_TYPE_BUY ? totalSellLot : totalBuyLot));
+
+// --- 3. วน Loop เพื่อหา P_target ที่ทำให้ Basket มีกำไร ---
+   double desiredBasketProfitUSD = InpMinBasketTargetProfitUSD > 0 ? InpMinBasketTargetProfitUSD : 0.10;
+   double pointVal = g_symbolInfo.Point();
+   double tickValue = g_symbolInfo.TickValue();
+   double tickSize  = g_symbolInfo.TickSize();
+
+   if(tickSize == 0 || pointVal == 0 || tickValue == 0)
+     {
+      Print("RecalculateMulti: TickSize, Point, or TickValue is zero! Cannot calculate P/L for P_Target search.");
+      return;
+     }
+   double valuePerPointPerFullLot = tickValue / tickSize * pointVal;
+   if(valuePerPointPerFullLot == 0)
+     {
+      Print("RecalculateMulti: Error calculating valuePerPointPerFullLot (is zero) for P_Target search.");
+      return;
+     }
+
+   double p_target_final = 0;
+   double best_p_target_found = 0;
+   double profit_at_best_ptarget = -DBL_MAX;
+
+   double sumOfPriceLotDir = 0;
+   for(int i=0; i < total_active_trades; i++)
+     {
+      int dir = (active_trades_in_cycle[i].type == ORDER_TYPE_BUY) ? 1 : -1;
+      sumOfPriceLotDir += active_trades_in_cycle[i].open_price * active_trades_in_cycle[i].current_lot * dir;
+     }
+
+   double startSearchPrice = sumOfPriceLotDir / netLotExposure;
+   if(!MathIsValidNumber(startSearchPrice) || startSearchPrice == 0)
+     {
+      startSearchPrice = (cycle.current_basket_dominant_direction == ORDER_TYPE_BUY) ? g_symbolInfo.Ask() : g_symbolInfo.Bid();
+      PrintFormat("RecalculateMulti: Approx BreakEven invalid or zero. Using market price as search start: %.5f for Cycle ID %s", startSearchPrice, cycle.id);
+     }
+   else
+     {
+      PrintFormat("RecalculateMulti: Approx BreakEven for P_Target search start: %.5f for Cycle ID %s", startSearchPrice, cycle.id);
+     }
+
+   int searchDirectionFactor = (cycle.current_basket_dominant_direction == ORDER_TYPE_BUY) ? 1 : -1;
+   int maxSearchIterations = 30000;
+   double priceSearchStep = pointVal;
+
+   for(int i = 0; i < maxSearchIterations; i++)
+     {
+      double current_p_test = startSearchPrice + (i * priceSearchStep * searchDirectionFactor);
+      // Sanity check for the first iteration if startSearchPrice itself is the test price
+      if(i==0)
+         current_p_test = startSearchPrice;
+
+
+      double basketPL_USD = 0;
+      for(int j = 0; j < total_active_trades; j++)
+        {
+         double pnl_points = 0;
+         if(active_trades_in_cycle[j].type == ORDER_TYPE_BUY)
+           {
+            pnl_points = (current_p_test - active_trades_in_cycle[j].open_price) / pointVal;
+           }
+         else // ORDER_TYPE_SELL
+           {
+            pnl_points = (active_trades_in_cycle[j].open_price - current_p_test) / pointVal;
+           }
+         basketPL_USD += pnl_points * active_trades_in_cycle[j].current_lot * valuePerPointPerFullLot;
+        }
+
+      if(basketPL_USD >= desiredBasketProfitUSD)
+        {
+         p_target_final = current_p_test;
+         PrintFormat("RecalculateMulti: Found P_Target = %.*f for Cycle %s. Target Basket P/L: %.2f USD. Iterations: %d",
+                     (int)g_symbolInfo.Digits(), p_target_final, cycle.id, basketPL_USD, i);
+         break;
+        }
+      if(basketPL_USD > profit_at_best_ptarget)
+        {
+         profit_at_best_ptarget = basketPL_USD;
+         best_p_target_found = current_p_test;
+        }
+     }
+
+   if(p_target_final == 0)
+     {
+      PrintFormat("RecalculateMulti: Could not find profitable P_Target (>=%.2f USD) for Cycle %s within %d iterations. Best P/L: %.2f USD at %.5f. No SL/TP modification this tick.",
+                  desiredBasketProfitUSD, cycle.id, maxSearchIterations, profit_at_best_ptarget, best_p_target_found);
+      cycle.calculated_basket_target_price = 0;
+      return;
+     }
+
+   cycle.calculated_basket_target_price = NormalizeDouble(p_target_final, (int)g_symbolInfo.Digits());
+
+// --- 4. Modify SL/TP ของทุกออเดอร์ในกลุ่ม ---
+   PrintFormat("RecalculateMulti: Setting SL/TP for %d trades in Cycle %s to Target Price: %.*f",
+               total_active_trades, cycle.id, (int)g_symbolInfo.Digits(), cycle.calculated_basket_target_price);
+
+   double finalTarget = cycle.calculated_basket_target_price;
+   double currentMarketBid = g_symbolInfo.Bid();
+   double currentMarketAsk = g_symbolInfo.Ask();
+   double stopLevelDistance = g_symbolInfo.StopsLevel() * pointVal;
+
+   for(int i = 0; i < total_active_trades; i++)
+     {
+      if(!position.SelectByTicket(active_trades_in_cycle[i].ticket))
+         continue;
+
+      double newSL = 0;
+      double newTP = 0;
+      bool canModify = true;
+      string modReason = "";
+
+      if(active_trades_in_cycle[i].type == cycle.current_basket_dominant_direction)
+        {
+         newTP = finalTarget;
+         newSL = 0;
+         if(active_trades_in_cycle[i].type == ORDER_TYPE_BUY && (newTP <= currentMarketAsk + stopLevelDistance))
+           {
+            canModify = false;
+            modReason="TP too close (Dom BUY)";
+           }
+         if(active_trades_in_cycle[i].type == ORDER_TYPE_SELL && (newTP >= currentMarketBid - stopLevelDistance))
+           {
+            canModify = false;
+            modReason="TP too close (Dom SELL)";
+           }
+        }
+      else
+        {
+         newSL = finalTarget;
+         newTP = 0;
+         if(active_trades_in_cycle[i].type == ORDER_TYPE_BUY && (newSL >= currentMarketBid - stopLevelDistance))
+           {
+            canModify = false;
+            modReason="SL too close (Opp BUY)";
+           }
+         if(active_trades_in_cycle[i].type == ORDER_TYPE_SELL && (newSL <= currentMarketAsk + stopLevelDistance))
+           {
+            canModify = false;
+            modReason="SL too close (Opp SELL)";
+           }
+        }
+
+      if(!canModify)
+        {
+         PrintFormat("RecalculateMulti: CANNOT modify Order #%lu (Type: %s) SL/TP to %.5f. Reason: %s (MktBid:%.5f, MktAsk:%.5f, SLevDist:%.5f). Current SL:%.5f TP:%.5f",
+                     active_trades_in_cycle[i].ticket, EnumToString(active_trades_in_cycle[i].type), finalTarget, modReason,
+                     currentMarketBid, currentMarketAsk, stopLevelDistance, position.StopLoss(), position.TakeProfit());
+         continue;
+        }
+
+      if(position.StopLoss() != newSL || position.TakeProfit() != newTP)
+        {
+         if(trade.PositionModify(active_trades_in_cycle[i].ticket, newSL, newTP))
+           {
+            PrintFormat("RecalculateMulti: Modified Order #%lu: SL=%.*f, TP=%.*f",
+                        active_trades_in_cycle[i].ticket, (int)g_symbolInfo.Digits(), newSL, (int)g_symbolInfo.Digits(), newTP);
+           }
+         else
+           {
+            PrintFormat("RecalculateMulti: FAILED to modify Order #%lu. SL=%.*f, TP=%.*f. Error: %d, Retcode: %d",
+                        active_trades_in_cycle[i].ticket, (int)g_symbolInfo.Digits(), newSL, (int)g_symbolInfo.Digits(), newTP, GetLastError(), trade.ResultRetcode());
+           }
+        }
+     }
+  }
+// Input Parameter ที่ควรจะมี (ถ้ายังไม่ได้เพิ่มในส่วน Input ของ EA และ OnInit)
+// input group "Trade Exit & Targets"
+// input double InpMinBasketTargetProfitUSD = 0.1; // กำไร USD ขั้นต่ำที่ต้องการเมื่อปิดรวบยอด Basket
+
+// Global variable (ถ้าจะใช้ Input และยังไม่ได้ประกาศ)
+// double g_min_basket_target_profit_usd;
+// ใน OnInit() (ถ้ายังไม่ได้เพิ่ม):
+// g_min_basket_target_profit_usd = InpMinBasketTargetProfitUSD;
+// ถ้า InpMinBasketTargetProfitUSD ไม่มี ก็ใช้ค่า Default ในฟังก์ชันนี้ไปก่อน
+
+//+------------------------------------------------------------------+
+//| Checks if the basket target profit is reached and closes all     |
+//| trades in the cycle.                                             |
+//+------------------------------------------------------------------+
+bool CheckAndCloseProfitableBasket(TradeCycle &cycle)
+  {
+   if(!cycle.is_active)
+      return false;
+
+// --- A. ตรวจสอบว่ามีออเดอร์ที่ยังเปิดอยู่ใน Cycle หรือไม่ และ Target Price ถูกตั้งค่าไว้หรือไม่ ---
+   int active_positions_in_cycle = CountActivePositionsInCycle(cycle); // ใช้ Helper Function ที่เราสร้างไว้
+
+   if(active_positions_in_cycle == 0) // ไม่มีออเดอร์เหลือใน Cycle นี้แล้ว
+     {
+      if(cycle.status != CYCLE_EMPTY) // ถ้าสถานะยังไม่เป็น Empty แต่ไม่มีออเดอร์
+        {
+         PrintFormat("CheckAndCloseProfitableBasket: No open positions found for active cycle ID %s. Resetting.", cycle.id);
+         ResetTradeCycle(cycle);
+        }
+      return true; // ถือว่า Cycle จบแล้ว (ไม่ว่าจะด้วยวิธีใด)
+     }
+
+   if(cycle.calculated_basket_target_price == 0) // ยังไม่มีเป้าหมาย Basket TP ที่ชัดเจน
+     {
+      // PrintFormat("DEBUG CheckAndCloseProfitableBasket: No calculated_basket_target_price for cycle ID %s.", cycle.id);
+      return false;
+     }
+
+// --- B. ตรวจสอบว่าราคาตลาดปัจจุบันถึง Target Price ที่คำนวณไว้หรือไม่ ---
+   bool target_price_market_reached = false;
+   double marketPriceForCheck = 0;
+   string marketPriceTypeStr = ""; // สำหรับ Logging
+
+   if(cycle.current_basket_dominant_direction == ORDER_TYPE_BUY)
+     {
+      marketPriceForCheck = g_symbolInfo.Bid(); // ถ้า Basket เป็น Buy, เราจะปิด Position โดยใช้ราคา Bid
+      marketPriceTypeStr = "Bid";
+      if(marketPriceForCheck >= cycle.calculated_basket_target_price)
+        {
+         target_price_market_reached = true;
+        }
+     }
+   else
+      if(cycle.current_basket_dominant_direction == ORDER_TYPE_SELL)
+        {
+         marketPriceForCheck = g_symbolInfo.Ask(); // ถ้า Basket เป็น Sell, เราจะปิด Position โดยใช้ราคา Ask
+         marketPriceTypeStr = "Ask";
+         if(marketPriceForCheck <= cycle.calculated_basket_target_price)
+           {
+            target_price_market_reached = true;
+           }
+        }
+      else // Dominant Direction ไม่ชัดเจน (เช่น Perfect Hedge)
+        {
+         // PrintFormat("DEBUG CheckAndCloseProfitableBasket: Dominant direction unclear for cycle ID %s. Cannot check market price against target.", cycle.id);
+         // ในกรณี Perfect Hedge ที่ netLotExposure เป็น 0, calculated_basket_target_price ก็ควรจะเป็น 0 ด้วย
+         // ซึ่งจะถูกดักไปตั้งแต่ตอนต้นฟังก์ชันแล้ว
+         return false;
+        }
+
+// --- C. ถ้า Target Price ถึงแล้วโดยการตรวจสอบราคาตลาด ---
+   if(target_price_market_reached)
+     {
+      PrintFormat("CheckAndCloseProfitableBasket: Market Price (%s: %.*f) Reached/Passed Calculated Target (%.*f) for Cycle ID %s (Dominant: %s).",
+                  marketPriceTypeStr, (int)g_symbolInfo.Digits(), marketPriceForCheck,
+                  (int)g_symbolInfo.Digits(), cycle.calculated_basket_target_price,
+                  cycle.id, EnumToString(cycle.current_basket_dominant_direction));
+
+      // คำนวณ P/L จริงของ Basket ณ ราคาตลาดปัจจุบัน เพื่อยืนยันอีกครั้ง
+      // (ใช้ InpMinBasketTargetProfitUSD จาก Input หรือค่า Default)
+      double desiredMinProfit = InpMinBasketTargetProfitUSD > 0 ? InpMinBasketTargetProfitUSD : 0.01;
+      double actualBasketPL_USD = CalculateCurrentBasketProfitUSD(cycle); // ใช้ Helper Function ที่เราสร้างไว้
+
+      PrintFormat("CheckAndCloseProfitableBasket: Current Actual Basket P/L for cycle %s is %.2f USD. Desired Min Profit: %.2f USD.",
+                  cycle.id, actualBasketPL_USD, desiredMinProfit);
+
+      // ปิด Basket ก็ต่อเมื่อ P/L จริง ณ ขณะนั้น มากกว่าหรือเท่ากับกำไรขั้นต่ำที่ต้องการ
+      if(actualBasketPL_USD >= desiredMinProfit)
+        {
+         PrintFormat("CheckAndCloseProfitableBasket: Actual P/L (%.2f USD) meets/exceeds desired min profit (%.2f USD). CLOSING ALL TRADES for cycle %s.",
+                     actualBasketPL_USD, desiredMinProfit, cycle.id);
+         CloseAllTradesInCycle(cycle, "BasketTP_MarketPrice_ConfirmedProfit");
+         ResetTradeCycle(cycle); // Reset Cycle หลังจากปิดทุกอย่างแล้ว
+         return true; // Cycle จบแล้ว
+        }
+      else
+        {
+         PrintFormat("CheckAndCloseProfitableBasket: Market reached target price, but actual P/L (%.2f USD) is less than desired min profit (%.2f USD). Holding / Re-evaluating SLTP.",
+                     actualBasketPL_USD, desiredMinProfit);
+         // ราคาแตะ Target แต่ P/L จริง (อาจจะเพราะ Spread, Slippage ณ ขณะนั้น) ยังไม่ถึงเป้า
+         // อาจจะ Reset calculated_basket_target_price เพื่อให้คำนวณใหม่ใน Tick หน้า
+         // หรืออาจจะรอให้ Broker ปิดด้วย SL/TP ที่ตั้งไว้ (ซึ่งอาจจะดีกว่าถ้าตั้งไว้แล้ว)
+         // เพื่อป้องกันการวน Loop ปิด-เปิด หรือ Modify บ่อยครั้งเกินไป
+         // เราอาจจะยังไม่ Reset calculated_basket_target_price ทันที แต่จะรอให้ SL/TP ของ Broker ทำงาน
+         // หรือถ้าผ่านไป X Ticks แล้วยังไม่ปิด ค่อยพิจารณา Force Close หรือคำนวณใหม่
+         // For now, we don't reset target, let SL/TP on orders try to close.
+         // If there's a persistent issue, manual check or more sophisticated logic is needed.
+         return false; // ยังไม่ปิดโดย EA เอง
+        }
+     }
+
+// --- D. ตรวจสอบทางอ้อม: ถ้าออเดอร์ใน Basket หายไป (อาจจะโดย SL/TP ของ Broker) ---
+// ส่วนนี้เป็น Fallback หรือการ Cleanup
+// ถ้า CountActivePositionsInCycle() ที่เรียกตอนต้น น้อยกว่า จำนวนออเดอร์ที่เราคาดว่าควรจะมีในสถานะปัจจุบันมากๆ
+// หรือถ้าไม้หลัก (เช่น Initial หรือ Hedge หรือ Counter-Hedge ที่เป็น Dominant) ถูกปิดไปแล้ว
+// อาจจะหมายความว่า Broker ได้ปิดบางส่วนหรือทั้งหมดไปแล้วที่ Basket Target Price
+// ในที่นี้ เราจะใช้การตรวจสอบว่า Initial Trade ยังอยู่หรือไม่ เป็นตัวแทนง่ายๆ ก่อน
+// (Logic นี้สามารถปรับปรุงให้ Robust ขึ้นได้อีกมาก)
+
+   if(cycle.initial_trade.ticket != 0 && !position.SelectByTicket(cycle.initial_trade.ticket) && cycle.status != CYCLE_EMPTY)
+     {
+      // Initial trade ถูกปิดไปแล้ว (อาจจะโดย Basket TP/SL ที่ตั้งไว้)
+      // และ Cycle ยังไม่ได้ถูก Reset
+      PrintFormat("CheckAndCloseProfitableBasket (Fallback): Initial trade #%lu for cycle ID %s seems closed by SL/TP. Cleaning up remaining trades if any.",
+                  cycle.initial_trade.ticket, cycle.id);
+      CloseAllTradesInCycle(cycle, "BasketTP_SLTP_Cleanup_After_InitialClose");
+      ResetTradeCycle(cycle);
+      return true; // Cycle จบแล้ว
+     }
+// อาจจะต้องเพิ่มการตรวจสอบสำหรับ Hedge และ Counter-Hedge ด้วย ถ้ามันกลายเป็น "ไม้หลัก" ของ Basket
+
+   return false; // Basket ยังไม่ถึงเป้า หรือยังไม่ถูกปิด
+  }
+//+------------------------------------------------------------------+
+//| Helper function to count active positions in a cycle.            |
+//+------------------------------------------------------------------+
+int CountActivePositionsInCycle(TradeCycle &cycle)
+  {
+   int count = 0;
+   if(cycle.initial_trade.ticket != 0 && position.SelectByTicket(cycle.initial_trade.ticket))
+      count++;
+   if(cycle.hedge_trade.ticket != 0 && position.SelectByTicket(cycle.hedge_trade.ticket))
+      count++;
+   if(cycle.counter_hedge_filled_trade.ticket != 0 && position.SelectByTicket(cycle.counter_hedge_filled_trade.ticket))
+      count++;
+   for(int i = 0; i < ArraySize(cycle.dca_trades); i++)
+     {
+      if(cycle.dca_trades[i].ticket != 0 && position.SelectByTicket(cycle.dca_trades[i].ticket))
+         count++;
+     }
+   return count;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper function to calculate current P/L (USD) of all trades in cycle.|
+//+------------------------------------------------------------------+
+double CalculateCurrentBasketProfitUSD(TradeCycle &cycle)
+  {
+   double totalProfitUSD = 0;
+   double pointVal = g_symbolInfo.Point();
+   double tickValue = g_symbolInfo.TickValue();
+   double tickSize  = g_symbolInfo.TickSize();
+
+   if(tickSize == 0 || pointVal == 0)
+     {
+      Print("CalculateCurrentBasketProfitUSD: TickSize or Point is zero!");
+      return 0; // หรือจัดการ Error แบบอื่น
+     }
+   double valuePerPointPerFullLot = tickValue / tickSize * pointVal;
+   if(valuePerPointPerFullLot == 0)
+     {
+      Print("CalculateCurrentBasketProfitUSD: Error calculating valuePerPointPerFullLot.");
+      return 0;
+     }
+
+// รวบรวม Active Trades อีกครั้งเพื่อให้แน่ใจ
+   TradeInCycle active_trades[];
+   int count = 0;
+   if(cycle.initial_trade.ticket != 0 && position.SelectByTicket(cycle.initial_trade.ticket))
+     { ArrayResize(active_trades, count + 1); active_trades[count] = cycle.initial_trade; active_trades[count++].current_lot = position.Volume();}
+   if(cycle.hedge_trade.ticket != 0 && position.SelectByTicket(cycle.hedge_trade.ticket))
+     { ArrayResize(active_trades, count + 1); active_trades[count] = cycle.hedge_trade; active_trades[count++].current_lot = position.Volume();}
+   if(cycle.counter_hedge_filled_trade.ticket != 0 && position.SelectByTicket(cycle.counter_hedge_filled_trade.ticket))
+     { ArrayResize(active_trades, count + 1); active_trades[count] = cycle.counter_hedge_filled_trade; active_trades[count++].current_lot = position.Volume();}
+   for(int i = 0; i < ArraySize(cycle.dca_trades); i++)
+     {
+      if(cycle.dca_trades[i].ticket != 0 && position.SelectByTicket(cycle.dca_trades[i].ticket))
+        {
+         ArrayResize(active_trades, count + 1);
+         active_trades[count] = cycle.dca_trades[i];
+         active_trades[count++].current_lot = position.Volume();
+        }
+     }
+
+   for(int i = 0; i < count; i++)
+     {
+      double pnl_points = 0;
+      double currentMarketPriceForTrade = (active_trades[i].type == ORDER_TYPE_BUY) ? g_symbolInfo.Bid() : g_symbolInfo.Ask();
+
+      if(active_trades[i].type == ORDER_TYPE_BUY)
+        {
+         pnl_points = (currentMarketPriceForTrade - active_trades[i].open_price) / pointVal;
+        }
+      else // ORDER_TYPE_SELL
+        {
+         pnl_points = (active_trades[i].open_price - currentMarketPriceForTrade) / pointVal;
+        }
+      totalProfitUSD += pnl_points * active_trades[i].current_lot * valuePerPointPerFullLot;
+     }
+   return totalProfitUSD;
+  }
+
+//+------------------------------------------------------------------+
+//| Helper function to close all trades in a given cycle.            |
+//+------------------------------------------------------------------+
+void CloseAllTradesInCycle(TradeCycle &cycle, string comment)
+  {
+   PrintFormat("CloseAllTradesInCycle: Closing all trades for cycle ID %s. Reason: %s", cycle.id, comment);
+   bool closed_any = false;
+
+   if(cycle.initial_trade.ticket != 0 && position.SelectByTicket(cycle.initial_trade.ticket))
+     {
+      if(trade.PositionClose(cycle.initial_trade.ticket, (ulong)InpSlippagePoints))
+         closed_any = true;
+      else
+         PrintFormat("Failed to close Initial Trade #%lu. Error: %d", cycle.initial_trade.ticket, GetLastError());
+     }
+   if(cycle.hedge_trade.ticket != 0 && position.SelectByTicket(cycle.hedge_trade.ticket))
+     {
+      if(trade.PositionClose(cycle.hedge_trade.ticket, (ulong)InpSlippagePoints))
+         closed_any = true;
+      else
+         PrintFormat("Failed to close Hedge Trade #%lu. Error: %d", cycle.hedge_trade.ticket, GetLastError());
+     }
+   if(cycle.counter_hedge_filled_trade.ticket != 0 && position.SelectByTicket(cycle.counter_hedge_filled_trade.ticket))
+     {
+      if(trade.PositionClose(cycle.counter_hedge_filled_trade.ticket, (ulong)InpSlippagePoints))
+         closed_any = true;
+      else
+         PrintFormat("Failed to close Counter-Hedge Trade #%lu. Error: %d", cycle.counter_hedge_filled_trade.ticket, GetLastError());
+     }
+   for(int i = 0; i < ArraySize(cycle.dca_trades); i++)
+     {
+      if(cycle.dca_trades[i].ticket != 0 && position.SelectByTicket(cycle.dca_trades[i].ticket))
+        {
+         if(trade.PositionClose(cycle.dca_trades[i].ticket, (ulong)InpSlippagePoints))
+            closed_any = true;
+         else
+            PrintFormat("Failed to close DCA Trade #%lu. Error: %d", cycle.dca_trades[i].ticket, GetLastError());
+        }
+     }
+   if(closed_any)
+      ChartRedraw(); // Redraw chart if any position was closed
+  }
+//+------------------------------------------------------------------+
+//| Calculates the lot size for a new DCA trade.                     |
+//+------------------------------------------------------------------+
+double CalculateDCALot(TradeCycle &cycle, ENUM_ORDER_TYPE dcaDirection)
+  {
+   if(!g_use_dca || cycle.dca_count >= g_max_dca_trades || g_dca_lot_multiplier <= 0)
+      return 0;
+
+   double baseLotForMultiplier = 0;
+
+// หากลุ่ม Lot ล่าสุดที่เปิดในทิศทางเดียวกับ dcaDirection เพื่อใช้เป็นฐาน
+// 1. ไล่จาก DCA trades ที่มีอยู่ (ถ้ามี)
+   for(int i = ArraySize(cycle.dca_trades) - 1; i >= 0; i--)
+     {
+      if(cycle.dca_trades[i].ticket != 0 && cycle.dca_trades[i].type == dcaDirection)
+        {
+         baseLotForMultiplier = cycle.dca_trades[i].current_lot; // ใช้ current_lot เผื่อมีการปิดบางส่วน
+         break;
+        }
+     }
+
+// 2. ถ้าไม่เจอใน DCA trades, ดู counter_hedge_filled_trade
+   if(baseLotForMultiplier == 0 && cycle.counter_hedge_filled_trade.ticket != 0 && cycle.counter_hedge_filled_trade.type == dcaDirection)
+     {
+      baseLotForMultiplier = cycle.counter_hedge_filled_trade.current_lot;
+     }
+
+// 3. ถ้าไม่เจอ, ดู hedge_trade
+   if(baseLotForMultiplier == 0 && cycle.hedge_trade.ticket != 0 && cycle.hedge_trade.type == dcaDirection)
+     {
+      baseLotForMultiplier = cycle.hedge_trade.current_lot;
+     }
+
+// 4. สุดท้ายดู initial_trade
+   if(baseLotForMultiplier == 0 && cycle.initial_trade.ticket != 0 && cycle.initial_trade.type == dcaDirection)
+     {
+      baseLotForMultiplier = cycle.initial_trade.current_lot;
+     }
+
+// 5. ถ้าไม่เจอเลย (ไม่ควรเกิดถ้า cycle มีออเดอร์ในทิศทางนั้นอยู่แล้ว) ให้ใช้ initial lot size ของ EA
+   if(baseLotForMultiplier == 0)
+     {
+      PrintFormat("CalculateDCALot: Could not find base lot for DCA in direction %s for cycle %s. Using EA's initial lot size %.2f as base.",
+                  EnumToString(dcaDirection), cycle.id, g_initial_lot_size);
+      baseLotForMultiplier = g_initial_lot_size;
+     }
+
+   double dcaLot = baseLotForMultiplier * g_dca_lot_multiplier;
+
+// Normalize lot size (เหมือนเดิม)
+   double minLot = g_symbolInfo.LotsMin();
+   double maxLot = g_symbolInfo.LotsMax();
+   double lotStepVal = g_symbolInfo.LotsStep();
+   if(lotStepVal <= 0)
+      lotStepVal = 0.01;
+
+   dcaLot = MathRound(dcaLot / lotStepVal) * lotStepVal;
+   if(dcaLot < minLot && minLot > 0)
+      dcaLot = minLot; // ปรับเงื่อนไข minLot > 0
+   if(dcaLot > maxLot && maxLot > 0)
+      dcaLot = maxLot; // ปรับเงื่อนไข maxLot > 0
+   dcaLot = NormalizeDouble(dcaLot, GetLotStepDigits(lotStepVal));
+
+   if(dcaLot < minLot && minLot > 0) // ตรวจสอบอีกครั้งหลัง Normalize
+     {
+      PrintFormat("CalculateDCALot: Final DCA Lot %.2f is less than MinLot %.2f for Cycle %s. Using MinLot.", dcaLot, minLot, cycle.id);
+      return minLot;
+     }
+
+   PrintFormat("CalculateDCALot for Cycle %s, Dir: %s. BaseLot: %.2f, Multiplier: %.1f, NewLot: %.2f",
+               cycle.id, EnumToString(dcaDirection), baseLotForMultiplier, g_dca_lot_multiplier, dcaLot);
+
+   return dcaLot;
+  }
+
+// Input Parameter ที่เกี่ยวข้องกับ DCA Signal (ถ้าจะใช้ Signal-based)
+// input group "DCA Strategy"
+// input bool InpDcaUseSignalInsteadOfPips = false; // ถ้า true จะใช้ Continuation Signal, false จะใช้ Pips Step
+// input ENUM_TIMEFRAMES InpDcaSignalTimeframe = PERIOD_M5; // Timeframe สำหรับหาสัญญาณ Continuation
+// input int InpDcaSignalStrengthThreshold = 2; // (สมมติ) ค่า Threshold ความแรงของ Continuation Signal
+
+// Input Parameter ที่เกี่ยวข้องกับ DCA Signal (ถ้าจะใช้ Signal-based)
+// input group "DCA Strategy"
+// input bool InpDcaUseStrictContinuationSignal = true; // ถ้า true, จะต้องได้ SIGNAL_CONTINUATION_... เท่านั้น, ถ้า false อาจจะอนุญาตจาก Daily Bias ที่แข็งแรงด้วย
+// input double InpDCAStepPipsRequired = 30.0; // ระยะ Pips ที่ราคาสวนทาง "จะต้อง" เกิดขึ้นเสมอ แม้จะมี Continuation Signal (ถ้า > 0)
+
+// --- ฟังก์ชัน ShouldEnterDCA (ปรับปรุงตามที่คุยกันล่าสุด) ---
+bool ShouldEnterDCA(TradeCycle &cycle, ENUM_BIAS_STATUS currentBias, ENUM_ORDER_TYPE dcaDirectionTarget)
+  {
+   if(!g_use_dca || cycle.dca_count >= g_max_dca_trades)
+     {
+      return false;
+     }
+
+   bool biasConditionMet = false;
+   if(dcaDirectionTarget == ORDER_TYPE_BUY)
+     {
+      if(currentBias == SIGNAL_CONTINUATION_BULLISH_M5 ||
+         ((currentBias == BIAS_D1_BULLISH_STRONG || currentBias == BIAS_D1_BULLISH_MODERATE) &&
+          currentBias != SIGNAL_REVERSAL_DOWN_M5 && currentBias != SIGNAL_REVERSAL_DOWN_M15 && currentBias != SIGNAL_OVB_H1))
+        {
+         biasConditionMet = true;
+        }
+     }
+   else
+      if(dcaDirectionTarget == ORDER_TYPE_SELL)
+        {
+         if(currentBias == SIGNAL_CONTINUATION_BEARISH_M5 ||
+            ((currentBias == BIAS_D1_BEARISH_STRONG || currentBias == BIAS_D1_BEARISH_MODERATE) &&
+             currentBias != SIGNAL_REVERSAL_UP_M5 && currentBias != SIGNAL_REVERSAL_UP_M15 && currentBias != SIGNAL_OVS_H1))
+           {
+            biasConditionMet = true;
+           }
+        }
+
+   if(!biasConditionMet)
+     {
+      return false;
+     }
+
+   if(g_dca_step_pips_or_signal > 0)
+     {
+      double priceMovementAgainstPips = 0;
+      double lastTradePriceInDcaDirection = 0;
+      bool foundLastTrade = false;
+
+      for(int i = ArraySize(cycle.dca_trades) - 1; i >= 0; i--)
+        {
+         if(cycle.dca_trades[i].ticket != 0 && cycle.dca_trades[i].type == dcaDirectionTarget)
+           {
+            if(position.SelectByTicket(cycle.dca_trades[i].ticket))
+              {
+               lastTradePriceInDcaDirection = position.PriceOpen();
+               foundLastTrade = true;
+               break;
+              }
+            else
+               cycle.dca_trades[i].ticket = 0;
+           }
+        }
+      if(!foundLastTrade && cycle.counter_hedge_filled_trade.ticket != 0 && cycle.counter_hedge_filled_trade.type == dcaDirectionTarget)
+        {
+         if(position.SelectByTicket(cycle.counter_hedge_filled_trade.ticket))
+           {
+            lastTradePriceInDcaDirection = position.PriceOpen();
+            foundLastTrade = true;
+           }
+         else
+            cycle.counter_hedge_filled_trade.ticket = 0;
+        }
+      if(!foundLastTrade && cycle.hedge_trade.ticket != 0 && cycle.hedge_trade.type == dcaDirectionTarget)
+        {
+         if(position.SelectByTicket(cycle.hedge_trade.ticket))
+           {
+            lastTradePriceInDcaDirection = position.PriceOpen();
+            foundLastTrade = true;
+           }
+         else
+            cycle.hedge_trade.ticket = 0;
+        }
+      if(!foundLastTrade && cycle.initial_trade.ticket != 0 && cycle.initial_trade.type == dcaDirectionTarget)
+        {
+         if(position.SelectByTicket(cycle.initial_trade.ticket))
+           {
+            lastTradePriceInDcaDirection = position.PriceOpen();
+            foundLastTrade = true;
+           }
+         else
+            cycle.initial_trade.ticket = 0;
+        }
+
+      if(!foundLastTrade || lastTradePriceInDcaDirection == 0)
+        {
+         PrintFormat("ShouldEnterDCA (Pips): ERROR - Could not find any last active trade price for DCA dir %s in Cycle %s.", EnumToString(dcaDirectionTarget), cycle.id);
+         return false;
+        }
+
+      if(dcaDirectionTarget == ORDER_TYPE_BUY)
+        {
+         priceMovementAgainstPips = (lastTradePriceInDcaDirection - g_symbolInfo.Ask()) / g_symbolInfo.Point();
+        }
+      else
+        {
+         priceMovementAgainstPips = (g_symbolInfo.Bid() - lastTradePriceInDcaDirection) / g_symbolInfo.Point();
+        }
+
+      if(priceMovementAgainstPips >= g_dca_step_pips_or_signal)
+        {
+         PrintFormat("ShouldEnterDCA: YES (Pips Step %.1f >= %.1f) for Cycle %s, Dir: %s. Bias: %s. LastTradePrice: %.5f",
+                     priceMovementAgainstPips, g_dca_step_pips_or_signal, cycle.id, EnumToString(dcaDirectionTarget),
+                     EnumToString(currentBias), lastTradePriceInDcaDirection);
+         return true;
+        }
+     }
+   else // Signal-based DCA
+     {
+      if((dcaDirectionTarget == ORDER_TYPE_BUY && currentBias == SIGNAL_CONTINUATION_BULLISH_M5) ||
+         (dcaDirectionTarget == ORDER_TYPE_SELL && currentBias == SIGNAL_CONTINUATION_BEARISH_M5))
+        {
+         PrintFormat("ShouldEnterDCA: YES (Signal Based) for Cycle %s, Dir: %s. Bias: %s (is Continuation).",
+                     cycle.id, EnumToString(dcaDirectionTarget), EnumToString(currentBias));
+         return true;
+        }
+     }
+   return false;
+  }
+//+------------------------------------------------------------------+
+//| Executes a DCA trade using CTrade and updates the cycle.         |
+//+------------------------------------------------------------------+
+ulong ExecuteDCATrade(TradeCycle &cycle, double dcaLot, ENUM_ORDER_TYPE dcaDirection)
+  {
+   if(dcaLot <= 0)
+     {
+      PrintFormat("ExecuteDCATrade: Invalid DCA Lot (%.2f) for Cycle %s.", dcaLot, cycle.id);
+      return 0;
+     }
+   if(!PerformOverallMarginCheck())
+     {
+      PrintFormat("ExecuteDCATrade: Margin Check FAILED for Cycle %s. Cannot open DCA.", cycle.id);
+      return 0;
+     }
+
+   string comment = g_comment_prefix + "DCA" + IntegerToString(cycle.dca_count + 1) + "_for_" + cycle.id;
+   bool success = false;
+   double marketPrice = SymbolInfoDouble(_Symbol, (dcaDirection == ORDER_TYPE_BUY) ? SYMBOL_ASK : SYMBOL_BID);
+
+   if(dcaDirection == ORDER_TYPE_BUY)
+     {
+      success = trade.Buy(dcaLot, _Symbol, marketPrice, 0.0, 0.0, comment);
+     }
+   else
+      if(dcaDirection == ORDER_TYPE_SELL)
+        {
+         success = trade.Sell(dcaLot, _Symbol, marketPrice, 0.0, 0.0, comment);
+        }
+
+   if(success)
+     {
+      PrintFormat("CTrade: DCA Trade Opened: %s for Cycle %s, Ticket: #%lu, Lot: %.2f, Price: %.5f. Retcode: %d",
+                  EnumToString(dcaDirection), cycle.id, trade.ResultOrder(), dcaLot, trade.ResultPrice(), trade.ResultRetcode());
+      return trade.ResultOrder();
+     }
+   else
+     {
+      PrintFormat("CTrade: DCA Trade Open FAILED for Cycle %s. Retcode: %d, Comment: %s, Last Error: %d",
+                  cycle.id, trade.ResultRetcode(), trade.ResultComment(), GetLastError());
+     }
+   return 0;
+  }
+//+------------------------------------------------------------------+
+//| Checks if a basket exit signal is present based on target price. |
+//| Does NOT close trades, only returns true if exit condition met.  |
+//+------------------------------------------------------------------+
+bool HasBasketExitSignal(TradeCycle &cycle, double &outActualBasketPL_USD) // outActualBasketPL_USD เพื่อคืนค่า P/L ปัจจุบัน
+  {
+   outActualBasketPL_USD = 0; // Initialize output
+
+   if(!cycle.is_active || cycle.calculated_basket_target_price == 0)
+      return false;
+
+   int active_positions = CountActivePositionsInCycle(cycle);
+   if(active_positions == 0)
+     {
+      // No positions, but cycle might still be marked active if not reset yet.
+      // This isn't an "exit signal" per se, but a state to be cleaned up.
+      return false; // Or true if we consider this an "exit" state that needs reset
+     }
+
+   bool target_price_market_reached = false;
+   double marketPriceForCheck = 0;
+
+   if(cycle.current_basket_dominant_direction == ORDER_TYPE_BUY)
+     {
+      marketPriceForCheck = g_symbolInfo.Bid();
+      if(marketPriceForCheck >= cycle.calculated_basket_target_price)
+        {
+         target_price_market_reached = true;
+        }
+     }
+   else
+      if(cycle.current_basket_dominant_direction == ORDER_TYPE_SELL)
+        {
+         marketPriceForCheck = g_symbolInfo.Ask();
+         if(marketPriceForCheck <= cycle.calculated_basket_target_price)
+           {
+            target_price_market_reached = true;
+           }
+        }
+      else
+        {
+         return false; // Dominant direction unclear
+        }
+
+   if(target_price_market_reached)
+     {
+      outActualBasketPL_USD = CalculateCurrentBasketProfitUSD(cycle);
+      double desiredMinProfit = g_min_basket_target_profit_usd > 0 ? g_min_basket_target_profit_usd : 0.01;
+
+      if(outActualBasketPL_USD >= desiredMinProfit)
+        {
+         PrintFormat("HasBasketExitSignal: YES. Market reached target AND P/L (%.2f) >= Desired (%.2f) for Cycle %s.",
+                     outActualBasketPL_USD, desiredMinProfit, cycle.id);
+         return true; // Exit signal is valid
+        }
+      else
+        {
+         PrintFormat("HasBasketExitSignal: Market reached target, but P/L (%.2f) < Desired (%.2f) for Cycle %s. No exit signal yet.",
+                     outActualBasketPL_USD, desiredMinProfit, cycle.id);
+         return false;
+        }
+     }
+
+// Fallback: Check if initial trade (or other key trades) were closed by broker's SL/TP
+// This implies the basket target was hit at the broker side.
+   if(cycle.initial_trade.ticket != 0 && !PositionSelectByTicket(cycle.initial_trade.ticket) && cycle.status != CYCLE_EMPTY)
+     {
+      PrintFormat("HasBasketExitSignal (Fallback): Initial trade #%lu for cycle ID %s seems closed by SL/TP. Exit signal present.",
+                  cycle.initial_trade.ticket, cycle.id);
+      outActualBasketPL_USD = CalculateCurrentBasketProfitUSD(cycle); // Recalculate P/L for logging
+      return true;
+     }
+
+   return false;
+  }
+// ฟังก์ชันเช็ค MACD Crossover
+// return true ถ้ามีสัญญาณ crossover เกิดขึ้นที่แท่งล่าสุด (แท่งก่อนแท่งปัจจุบัน)
+// direction = 1 (Buy), direction = -1 (Sell)
+bool macd_crossover(int direction, int tf = PERIOD_CURRENT, int fast_ema = 12, int slow_ema = 26, int signal_sma = 9)
+  {
+   double macd_curr, signal_curr;
+   double macd_prev, signal_prev;
+
+// ถ้าเป็น MQL5 ใช้ iMACD
+   int handle = iMACD(_Symbol, PERIOD_CURRENT, fast_ema, slow_ema, signal_sma, PRICE_CLOSE);
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   double macdBuffer[3], signalBuffer[3];
+   if(CopyBuffer(handle, 0, 0, 3, macdBuffer) <= 0)
+     {
+      IndicatorRelease(handle);
+      return false;
+     }
+   if(CopyBuffer(handle, 1, 0, 3, signalBuffer) <= 0)
+     {
+      IndicatorRelease(handle);
+      return false;
+     }
+
+   IndicatorRelease(handle);
+
+   macd_curr = macdBuffer[1];   // [0] แท่งปัจจุบันกำลังสร้าง, [1] คือแท่งล่าสุดปิดไป
+   signal_curr = signalBuffer[1];
+
+   macd_prev = macdBuffer[2];
+   signal_prev = signalBuffer[2];
+
+   if(direction == 1) // Buy crossover: MACD ตัดขึ้น
+     {
+      if(macd_curr < 0 && macd_curr > signal_prev)
+         return true;
+     }
+   else
+      if(direction == -1) // Sell crossover: MACD ตัดลง
+        {
+         if(macd_curr > 0 && macd_curr < signal_prev)
+            return true;
+        }
+   return false;
+  }
+//+------------------------------------------------------------------+
+bool CloseAllOrdersWhenProfitTargetReached()
+  {
+   double totalProfit = 0.0;
+
+// รวมกำไรออเดอร์ที่เปิดอยู่
+   for(int i=0;i<PositionsTotal();i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+        {
+         // เฉพาะสัญลักษณ์นี้
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+           {
+            totalProfit += PositionGetDouble(POSITION_PROFIT);
+           }
+        }
+     }
+
+// ถ้ากำไรตามเป้า
+   if(totalProfit >= InpTargetProfit)
+     {
+      // ปิดทุกออเดอร์ใน symbol นี้ (ถ้าต้องการทุก symbol ให้เอา if ออก)
+      for(int i=PositionsTotal()-1; i>=0; i--)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(PositionSelectByTicket(ticket))
+           {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            long type = PositionGetInteger(POSITION_TYPE);
+
+            // ถ้าเฉพาะสัญลักษณ์นี้
+            if(symbol == _Symbol)
+              {
+               bool closed = trade.PositionClose(ticket);
+               if(closed)
+                  PrintFormat("Closed ticket %d, totalProfit: %.2f", ticket, totalProfit);
+               else
+                  PrintFormat("FAILED to close ticket %d, error: %s", ticket, GetLastError());
+              }
+           }
+        }
+      return true;
+     }
+
+   return false;
+  }
+//+------------------------------------------------------------------+
+//| Manages Trailing Stops for all active orders in the current cycle|
+//| when the basket profit reaches a specified target.               |
+//+------------------------------------------------------------------+
+void TrailAllOrdersWhenProfitTargetReached(TradeCycle &cycle)
+  {
+   if(!g_use_basket_trailing_stop || !cycle.is_active || cycle.status == CYCLE_EMPTY) // ใช้ Global Var g_use_basket_trailing_stop
+      return;
+
+// 1. คำนวณ P/L ปัจจุบันของ Basket เป็น Pips
+//    (เราอาจจะต้องมีฟังก์ชันช่วยคำนวณ P/L ของ Basket เป็น Pips หรือ USD)
+//    ในที่นี้จะใช้ CalculateCurrentBasketProfitUSD() ที่เรามี แล้วแปลงเป็น Pips โดยประมาณ
+//    หรือจะสร้างฟังก์ชัน CalculateCurrentBasketProfitPips() โดยตรง
+
+   double currentBasketProfitUSD = CalculateCurrentBasketProfitUSD(cycle); // ได้ P/L เป็น USD
+   if(!MathIsValidNumber(currentBasketProfitUSD))
+     {
+      // PrintFormat("TrailAllOrders: Could not calculate current basket P/L for cycle %s", cycle.id);
+      return;
+     }
+
+// สมมติว่าเราต้องการให้ Basket มีกำไรอย่างน้อย X Pips ก่อนเริ่ม Trail
+// เราสามารถแปลง g_basket_profit_pips_to_start_trail เป็น USD โดยประมาณ
+// หรือจะคำนวณ P/L ของ Basket เป็น Pips โดยตรง
+// เพื่อความง่าย จะใช้ P/L USD เทียบกับ g_min_basket_target_profit_usd (หรือ Input ใหม่สำหรับ Trailing Start USD)
+// หรือถ้า InpBasketProfitPipsToStartTrail > 0 ก็คำนวณ P/L เป็น Pips
+
+   double netLotForPipsCalc = 0;
+   double avgEntryPriceForPipsCalc = 0; // อาจจะไม่จำเป็นถ้าดู P/L USD
+   int active_trades_count = 0;
+
+// รวบรวม Active Trades และคำนวณ Net Lot
+   TradeInCycle active_trades_for_trail[];
+// (ส่วนรวบรวม Active Trades เหมือนใน RecalculateAndSetBasketSLTP_ForMultiOrderBasket)
+   if(cycle.initial_trade.ticket != 0 && position.SelectByTicket(cycle.initial_trade.ticket))
+     { ArrayResize(active_trades_for_trail, active_trades_count + 1); active_trades_for_trail[active_trades_count++] = cycle.initial_trade; active_trades_for_trail[active_trades_count-1].current_lot = position.Volume();}
+   if(cycle.hedge_trade.ticket != 0 && position.SelectByTicket(cycle.hedge_trade.ticket))
+     { ArrayResize(active_trades_for_trail, active_trades_count + 1); active_trades_for_trail[active_trades_count++] = cycle.hedge_trade; active_trades_for_trail[active_trades_count-1].current_lot = position.Volume();}
+   if(cycle.counter_hedge_filled_trade.ticket != 0 && position.SelectByTicket(cycle.counter_hedge_filled_trade.ticket))
+     { ArrayResize(active_trades_for_trail, active_trades_count + 1); active_trades_for_trail[active_trades_count++] = cycle.counter_hedge_filled_trade; active_trades_for_trail[active_trades_count-1].current_lot = position.Volume();}
+   for(int i = 0; i < ArraySize(cycle.dca_trades); i++)
+     {
+      if(cycle.dca_trades[i].ticket != 0 && position.SelectByTicket(cycle.dca_trades[i].ticket))
+        {
+         ArrayResize(active_trades_for_trail, active_trades_count + 1);
+         active_trades_for_trail[active_trades_count++] = cycle.dca_trades[i];
+         active_trades_for_trail[active_trades_count-1].current_lot = position.Volume();
+        }
+     }
+   if(active_trades_count == 0)
+      return;
+
+
+// คำนวณ P/L รวมของ Basket เป็น Pips (วิธีนี้จะซับซ้อนกว่าการใช้ P/L USD)
+// เพื่อความง่ายในตอนนี้ เราจะใช้ currentBasketProfitUSD เทียบกับ g_min_basket_target_profit_usd
+// หรือจะใช้ Input ใหม่ InpBasketProfitUSDToStartTrail
+   double profitUSDToStartTrail = g_min_basket_target_profit_usd + (g_basket_profit_pips_to_start_trail * g_symbolInfo.Point() * cycle.current_basket_dominant_lot * (g_symbolInfo.TickValue() / g_symbolInfo.TickSize() * g_symbolInfo.Point()));
+// สมมติว่าเราใช้ g_basket_profit_pips_to_start_trail และแปลงเป็น USD โดยประมาณ
+// หรือจะใช้ Input Parameter ใหม่สำหรับ USD Profit to start trailing ไปเลยจะง่ายกว่า
+// เช่น input double InpBasketProfitUSDToStartTrail = 2.0; // เริ่ม Trail เมื่อ Basket กำไร 2 USD
+
+   if(currentBasketProfitUSD < InpBasketProfitPipsToStartTrail)  // แก้ไข: InpBasketProfitPipsToStartTrail ควรจะเป็น USD หรือแปลง Pips เป็น USD ก่อนเทียบ
+     {
+      // สมมติ InpBasketProfitPipsToStartTrail คือ USD ไปก่อน
+      // PrintFormat("TrailAllOrders: Basket Profit (%.2f USD) not yet reached StartTrail Profit (%.2f USD) for Cycle %s.",
+      //            currentBasketProfitUSD, InpBasketProfitPipsToStartTrail, cycle.id);
+      return;
+     }
+
+   PrintFormat("TrailAllOrders: Basket Profit (%.2f USD) reached StartTrail Profit (%.2f USD) for Cycle %s. Activating Trailing Stop.",
+               currentBasketProfitUSD, InpBasketProfitPipsToStartTrail, cycle.id);
+
+// 2. คำนวณ Trailing Stop Distance (ใช้ Fixed Pips ก่อนเพื่อความง่าย)
+   double trail_distance_price = g_basket_trail_step_pips * g_symbolInfo.Point(); // ใช้ Global Var ที่ Map จาก Input
+   if(trail_distance_price <= 0)
+     {
+      PrintFormat("TrailAllOrders: Invalid BasketTrailStepPips (%.1f) for Cycle %s.", g_basket_trail_step_pips, cycle.id);
+      return;
+     }
+
+// 3. วน Loop ผ่านออเดอร์ทุกไม้ที่ยัง Active อยู่ใน Cycle
+   for(int i = 0; i < active_trades_count; i++)
+     {
+      if(!position.SelectByTicket(active_trades_for_trail[i].ticket))
+         continue;
+
+      ENUM_ORDER_TYPE orderType = active_trades_for_trail[i].type;
+      double currentSL_price = position.StopLoss();
+      double currentTP_price = position.TakeProfit(); // TP เดิม (อาจจะเป็น Basket Target)
+      double newSL_price = 0;
+
+      if(orderType == ORDER_TYPE_BUY)
+        {
+         // สำหรับ Buy, SL ใหม่คือ ราคา Bid ปัจจุบัน - ระยะ Trailing
+         newSL_price = g_symbolInfo.Bid() - trail_distance_price;
+         // SL ใหม่ต้องดีกว่า SL เดิม (สูงกว่า) และต้องไม่ทำให้ Position ปิดทันที
+         if(newSL_price > currentSL_price && newSL_price < g_symbolInfo.Bid() - g_symbolInfo.StopsLevel() * g_symbolInfo.Point())
+           {
+            // Modify Position SL
+            if(trade.PositionModify(active_trades_for_trail[i].ticket, newSL_price, currentTP_price))
+              {
+               PrintFormat("TrailAllOrders: BUY Pos #%lu SL Trailed to %.*f (Old SL: %.*f) for Cycle %s",
+                           active_trades_for_trail[i].ticket,
+                           (int)g_symbolInfo.Digits(), newSL_price,
+                           (int)g_symbolInfo.Digits(), currentSL_price, cycle.id);
+              }
+            else
+              {
+               PrintFormat("TrailAllOrders: FAILED to trail BUY Pos #%lu SL. Error: %d, Retcode: %d",
+                           active_trades_for_trail[i].ticket, GetLastError(), trade.ResultRetcode());
+              }
+           }
+        }
+      else
+         if(orderType == ORDER_TYPE_SELL)
+           {
+            // สำหรับ Sell, SL ใหม่คือ ราคา Ask ปัจจุบัน + ระยะ Trailing
+            newSL_price = g_symbolInfo.Ask() + trail_distance_price;
+            // SL ใหม่ต้องดีกว่า SL เดิม (ต่ำกว่า) และ SL ใหม่ต้องไม่ทำให้ Position ปิดทันที
+            if((newSL_price < currentSL_price || currentSL_price == 0) && newSL_price > g_symbolInfo.Ask() + g_symbolInfo.StopsLevel() * g_symbolInfo.Point())
+              {
+               if(trade.PositionModify(active_trades_for_trail[i].ticket, newSL_price, currentTP_price))
+                 {
+                  PrintFormat("TrailAllOrders: SELL Pos #%lu SL Trailed to %.*f (Old SL: %.*f) for Cycle %s",
+                              active_trades_for_trail[i].ticket,
+                              (int)g_symbolInfo.Digits(), newSL_price,
+                              (int)g_symbolInfo.Digits(), currentSL_price, cycle.id);
+                 }
+               else
+                 {
+                  PrintFormat("TrailAllOrders: FAILED to trail SELL Pos #%lu SL. Error: %d, Retcode: %d",
+                              active_trades_for_trail[i].ticket, GetLastError(), trade.ResultRetcode());
+                 }
+              }
+           }
+      // เราจะยังคง TP เดิมไว้ (ซึ่งควรจะเป็น Basket Target Price) หรือถ้า TP เป็น 0 ก็ปล่อยไว้
+      // การ Trailing Stop จะเป็นการเลื่อน SL ตามกำไร โดยไม่ยุ่งกับ TP
+     }
+  }
+
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool TrailAllOrdersWhenProfitTargetReached()
+  {
+   double profit = 0.0;
+
+// สะสมกำไรรวมของทุกออเดอร์ (เฉพาะ symbol นี้)
+   for(int i=0; i<PositionsTotal(); i++)
+     {
+      if(PositionGetTicket(i) && PositionGetString(POSITION_SYMBOL) == _Symbol)
+        {
+         profit += PositionGetDouble(POSITION_PROFIT);
+        }
+     }
+
+   if(profit >= InpTargetProfit_)
+     {
+      // เริ่มทำ trailing stop ทุกออเดอร์ใน symbol นี้
+      for(int i=0; i<PositionsTotal(); i++)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(PositionSelectByTicket(ticket))
+           {
+            if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+               continue;
+
+            double price = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                           : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+            double sl = 0.0;
+            if(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)
+               sl = price - InpTrailDistance * _Point;
+            else
+               sl = price + InpTrailDistance * _Point;
+
+            double oldSL = PositionGetDouble(POSITION_SL);
+            double tp    = PositionGetDouble(POSITION_TP);
+
+            // กรณีเดิม SL ยังไม่มี หรือ trail ต่อไปข้างดีขึ้นกว่าเดิม
+            if((PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY && (sl > oldSL || oldSL == 0.0)) ||
+               (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_SELL && (sl < oldSL || oldSL == 0.0)))
+              {
+               bool modOK = trade.PositionModify(ticket, sl, tp);
+               if(modOK)
+                  PrintFormat("Trailing SL for ticket %d set to: %.5f", ticket, sl);
+               else
+                  PrintFormat("Failed to trail SL ticket %d (error: %s)", ticket, trade.ResultRetcodeDescription());
+              }
+           }
+        }
+      return true;
+     }
+   return false;
+  }
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool isMACDNegativeRisingAndAboveSignal(
+   int tf = PERIOD_CURRENT,
+   int fast_ema = 12,
+   int slow_ema = 26,
+   int signal_sma = 9)
+  {
+   int handle = iMACD(_Symbol, PERIOD_CURRENT, fast_ema, slow_ema, signal_sma, PRICE_CLOSE);
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   double macd[3], signal[3];
+   if(CopyBuffer(handle, 0, 0, 3, macd) <= 0 ||
+      CopyBuffer(handle, 1, 0, 3, signal) <= 0)
+     {
+      IndicatorRelease(handle);
+      return false;
+     }
+   IndicatorRelease(handle);
+
+// macd[1] => close ล่าสุด, macd[2] => close ก่อนหน้า
+   double macd_curr   = macd[1];
+   double macd_prev   = macd[2];
+   double signal_curr = signal[1];
+
+// เงื่อนไข: macd < 0, แต่กำลังเพิ่มขึ้น, และเหนือ signal
+   if(macd_curr > 0 && macd_curr > macd_prev && macd_curr < signal_curr)
+      return true;
+
+   return false;
+  }
+// ฟังก์ชันช่วยคำนวณค่าเฉลี่ย Volume ของ X แท่งล่าสุดย้อนหลัง
+long GetAverageVolume(int tf = PERIOD_CURRENT, int bars = 5)
+  {
+   long sum = 0;
+   for(int i = 1; i <= bars; i++) // เริ่มที่ 1 เพื่อไม่ดึง volume แท่งปัจจุบัน
+      sum += iVolume(_Symbol, PERIOD_CURRENT, i);
+   return (bars > 0) ? sum / bars : 0;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void STrategy_Buy()
+  {
+   int tf = PERIOD_CURRENT;
+
+   if(isMACDNegativeRisingAndAboveSignal(tf))
+     {
+      Print("MACD ลบ แต่กำลังฟื้นตัวขึ้นและอยู่เหนือ signal แล้ว");
+
+      long vol = iVolume(_Symbol, PERIOD_CURRENT, 0);  // tick volume แท่งปัจจุบัน
+      long avgVol = GetAverageVolume(PERIOD_CURRENT, 5);   // ค่าเฉลี่ย 5 แท่งก่อนหน้า
+
+      PrintFormat("Tick Volume = %d | AvgVolume5 = %d", vol, avgVol);
+
+      if(vol > avgVol*0.8)
+        {
+         
+         double sl = 0, tp = 0;
+         if(trade.Buy(InpLotSizeInitial, _Symbol, 0, sl, tp, "MACD signals"))
+           {
+            Print("ส่งคำสั่ง BUY เรียบร้อยแล้ว");
+           }
+         else
+           {
+            Print("ผิดพลาด ไม่สามารถเปิด BUY: ", GetLastError());
+           }
+        }
+     }
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool isMACDNegativeFallingAndBelowSignal(
+   int tf = PERIOD_CURRENT,
+   int fast_ema = 12,
+   int slow_ema = 26,
+   int signal_sma = 9)
+  {
+   int handle = iMACD(_Symbol, PERIOD_CURRENT, fast_ema, slow_ema, signal_sma, PRICE_CLOSE);
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   double macd[3], signal[3];
+   if(CopyBuffer(handle, 0, 0, 3, macd) <= 0 ||
+      CopyBuffer(handle, 1, 0, 3, signal) <= 0)
+     {
+      IndicatorRelease(handle);
+      return false;
+     }
+   IndicatorRelease(handle);
+
+// macd[1] => close ล่าสุด, macd[2] => close ก่อนหน้า
+   double macd_curr   = macd[1];
+   double macd_prev   = macd[2];
+   double signal_curr = signal[1];
+
+// เงื่อนไข: macd < 0, กำลังลดลง (ขาลง) และต่ำกว่า signal
+   if(macd_curr < 0 && macd_curr < macd_prev && macd_curr > signal_curr)
+      return true;
+
+   return false;
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void STrategy_Sell()
+  {
+// สามารถเลือก Timeframe ได้ตามต้องการ (ตัวอย่างใช้ PERIOD_CURRENT)
+   if(isMACDNegativeFallingAndBelowSignal(PERIOD_CURRENT))
+     {
+      Print("MACD ลบ กำลังลดลงและอยู่ต่ำกว่า signal แล้ว");
+
+      // ใช้ Volume แบบ Tick ล่าสุด
+      long vol = iVolume(_Symbol, PERIOD_CURRENT, 0);
+       long avgVol = GetAverageVolume(PERIOD_CURRENT, 5);
+      Print("Tick Volume = ", vol);
+
+      if(vol > avgVol*0.8)
+        {
+         double lot = 0.01; // หรือปรับได้
+         double sl = 0, tp = 0;
+
+         // เช็ค order sell เท่าที่จำเป็นเอง
+         if(trade.Sell(InpLotSizeInitial, _Symbol, 0, sl, tp, "MACD signals"))
+           {
+            Print("ส่งคำสั่ง SELL เรียบร้อยแล้ว");
+           }
+         else
+           {
+            Print("ผิดพลาด ไม่สามารถเปิด SELL: ", GetLastError());
+           }
+        }
+     }
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void ZigZagOnChart()
+  {
+// ค่ากำหนด ZigZag
+   int zigzag_depth = 12;
+   int zigzag_dev   = 5;
+   int zigzag_back  = 3;
+   int lookback     = 200;
+
+// หาจุด swing
+   SwingPoint swings_arr[];
+   FindSwingPoints_ZigZag(PERIOD_M15, swings_arr, zigzag_depth, zigzag_dev, zigzag_back, lookback);
+
+// วาด label
+   DrawSwingLabels(swings_arr);
+  }
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Checks M15 RSI for Overbought/Oversold conditions.             |
+//+------------------------------------------------------------------+
+ENUM_BIAS_STATUS CheckM15RsiWarning()
+{
+    if(h_M15_RSI14 == INVALID_HANDLE) { // ควรจะตรวจสอบ Handle ก่อนใช้เสมอ
+        // if(g_enable_bias_logic) Print("CheckM15RsiWarning: M15 RSI14 handle invalid."); // Print เฉพาะถ้า Logic เปิด
+        return BIAS_NEUTRAL;
+    }
+    double rsi_M15_values[1];
+    // ดึงค่า RSI ของแท่งที่ปิดไปแล้ว (shift 1) เพื่อความแน่นอน
+    if(CopyBuffer(h_M15_RSI14, 0, 1, 1, rsi_M15_values) == 1 && rsi_M15_values[0] != 0.0 && MathIsValidNumber(rsi_M15_values[0]))
+    {
+        double rsi_M15 = rsi_M15_values[0];
+        if(rsi_M15 >= InpM15RsiOvbLevel) return SIGNAL_OVB_M15;
+        if(rsi_M15 <= InpM15RsiOvsLevel) return SIGNAL_OVS_M15;
+    }
+    return BIAS_NEUTRAL;
+}
+
+struct M5SignalContext
+{
+    double close_s1; // ราคาปิด M5 shift 1
+    double open_s1;  // ราคาเปิด M5 shift 1
+    double high_s1;  // ราคาสูงสุด M5 shift 1
+    double low_s1;   // ราคาต่ำสุด M5 shift 1
+    double atr_s1;   // ค่า ATR(M5) ของ shift 1 (ตาม InpM5AtrPeriod)
+    double point;
+    int    digits;
+};
+
+//+------------------------------------------------------------------+
+//| Prepares necessary M5 values from the last closed bar (shift 1).|
+//+------------------------------------------------------------------+
+bool PrepareM5SignalValues(M5SignalContext &ctx)
+{
+    ctx.close_s1 = iClose(_Symbol, PERIOD_M5, 1);
+    ctx.open_s1  = iOpen(_Symbol,  PERIOD_M5, 1);
+    ctx.high_s1  = iHigh(_Symbol,  PERIOD_M5, 1);
+    ctx.low_s1   = iLow(_Symbol,   PERIOD_M5, 1);
+    ctx.point    = g_symbolInfo.Point();
+    ctx.digits   = (int)g_symbolInfo.Digits();
+
+    if(ctx.open_s1 == 0 || ctx.high_s1 == 0 || ctx.low_s1 == 0 || ctx.close_s1 == 0) {
+        // Print("PrepareM5SignalValues: Invalid M5 OHLC data at shift 1.");
+        return false; // ข้อมูลแท่งเทียนไม่สมบูรณ์
+    }
+
+    double atr_buffer[1];
+    // ใช้ h_M5_ATR14 ที่ Initialize ด้วย InpM5AtrPeriod
+    if(h_M5_ATR14 != INVALID_HANDLE && CopyBuffer(h_M5_ATR14, 0, 1, 1, atr_buffer) == 1 && atr_buffer[0] != 0.0 && MathIsValidNumber(atr_buffer[0])) {
+        ctx.atr_s1 = atr_buffer[0];
+    } else {
+        if(h_M5_ATR14 == INVALID_HANDLE && g_enable_bias_logic) Print("PrepareM5SignalValues: M5 ATR handle invalid.");
+        ctx.atr_s1 = ctx.point * 100; // Fallback
+        if(ctx.atr_s1 == 0 && ctx.point != 0) ctx.atr_s1 = ctx.point * 20; // Another fallback if 100 points is too large or point is very small
+        else if (ctx.atr_s1 == 0 && ctx.point == 0) return false; // Critical if point is zero
+    }
+    return true;
+}
+//+------------------------------------------------------------------+
+//| Detects M5 Reversal Signals (Change of Character).               |
+//+------------------------------------------------------------------+
+ENUM_BIAS_STATUS DetectM5ReversalSignal(const M5SignalContext &ctx, const SwingPoint &m5_swings[])
+{
+    if(ArraySize(m5_swings) < 2) return BIAS_NEUTRAL;
+
+    SwingPoint last_swing = m5_swings[0]; // Most recent confirmed swing
+    SwingPoint prev_swing = m5_swings[1]; // Swing before the most recent
+
+    // Ensure swings are valid and correctly ordered (last_swing.shift < prev_swing.shift)
+    if (last_swing.shift >= prev_swing.shift || last_swing.time == 0 || prev_swing.time ==0 ) {
+        // PrintFormat("DetectM5Reversal: Swings misordered, identical or invalid. LastShift: %d, PrevShift: %d", last_swing.shift, prev_swing.shift);
+        return BIAS_NEUTRAL;
+    }
+
+    double bar_s1_range = ctx.high_s1 - ctx.low_s1;
+    if(bar_s1_range < ctx.point * 1) bar_s1_range = ctx.point * 1;
+    double bar_s1_body  = MathAbs(ctx.close_s1 - ctx.open_s1);
+
+    // Reversal UP: Previous swing was High, Last (more recent) swing was Low.
+    // Current bar (shift 1) breaks above the Previous Swing High.
+    if(prev_swing.isHigh && !last_swing.isHigh) {
+        double break_level = prev_swing.price;
+        if(ctx.close_s1 > break_level + (ctx.atr_s1 * InpM5BreakoutATRMult) && // Closed above break + ATR buffer
+           ctx.close_s1 > ctx.open_s1 &&                                     // Bullish bar
+           (bar_s1_body / bar_s1_range >= InpM5EngulfMinBodyRatio) ) {       // Strong body
+            // PrintFormat("DetectM5Reversal: SIGNAL_REVERSAL_UP_M5. Broke SH@%.*f", ctx.digits, break_level);
+            return SIGNAL_REVERSAL_UP_M5;
+        }
+    }
+    // Reversal DOWN: Previous swing was Low, Last (more recent) swing was High.
+    // Current bar (shift 1) breaks below the Previous Swing Low.
+    else if(!prev_swing.isHigh && last_swing.isHigh) {
+        double break_level = prev_swing.price;
+        if(ctx.close_s1 < break_level - (ctx.atr_s1 * InpM5BreakoutATRMult) && // Closed below break - ATR buffer
+           ctx.close_s1 < ctx.open_s1 &&                                     // Bearish bar
+           (bar_s1_body / bar_s1_range >= InpM5EngulfMinBodyRatio) ) {       // Strong body
+            // PrintFormat("DetectM5Reversal: SIGNAL_REVERSAL_DOWN_M5. Broke SL@%.*f", ctx.digits, break_level);
+            return SIGNAL_REVERSAL_DOWN_M5;
+        }
+    }
+    return BIAS_NEUTRAL;
+}
+//+------------------------------------------------------------------+
+//| Detects M5 Continuation Signals.                                 |
+//+------------------------------------------------------------------+
+ENUM_BIAS_STATUS DetectM5ContinuationSignal(const M5SignalContext &ctx, ENUM_BIAS_STATUS rsi_m15_warning)
+{
+    if(h_M5_EMA9 == INVALID_HANDLE || h_M5_EMA20 == INVALID_HANDLE) {
+        // if(g_enable_initial_entry_logic || g_use_dca) Print("DetectM5Cont: M5 EMA handles invalid."); // Print ถ้า Logic นี้ Active
+        return BIAS_NEUTRAL;
+    }
+
+    double ema9_buffer[1], ema20_buffer[1];
+    // Get EMA values for the last closed M5 bar (shift 1)
+    if(CopyBuffer(h_M5_EMA9, 0, 1, 1, ema9_buffer) == 1 &&
+       CopyBuffer(h_M5_EMA20, 0, 1, 1, ema20_buffer) == 1 &&
+       ema9_buffer[0] != 0.0 && MathIsValidNumber(ema9_buffer[0]) &&
+       ema20_buffer[0] != 0.0 && MathIsValidNumber(ema20_buffer[0]))
+    {
+        double ema9_s1  = ema9_buffer[0];
+        double ema20_s1 = ema20_buffer[0];
+
+        // Bullish Continuation: Close > EMA9, EMA9 > EMA20, M15 not OVB
+        if(ctx.close_s1 > ema9_s1 && ema9_s1 > ema20_s1) {
+            if(rsi_m15_warning != SIGNAL_OVB_M15) { // M15 ไม่ Overbought
+                // Print("DetectM5Cont: SIGNAL_CONTINUATION_BULLISH_M5");
+                return SIGNAL_CONTINUATION_BULLISH_M5;
+            }
+        }
+        // Bearish Continuation: Close < EMA9, EMA9 < EMA20, M15 not OVS
+        else if(ctx.close_s1 < ema9_s1 && ema9_s1 < ema20_s1) {
+            if(rsi_m15_warning != SIGNAL_OVS_M15) { // M15 ไม่ Oversold
+                // Print("DetectM5Cont: SIGNAL_CONTINUATION_BEARISH_M5");
+                return SIGNAL_CONTINUATION_BEARISH_M5;
+            }
+        }
+    } else {
+        // Print("DetectM5Cont: Error copying M5 EMA buffers for continuation check.");
+    }
+    return BIAS_NEUTRAL;
+}
+// Helper functions (ต้องมีในโค้ดของคุณ)
+bool IsConsideredBullishLeaning(ENUM_BIAS_STATUS bias) {
+    return (bias == BIAS_BULLISH_WEAK || bias == BIAS_BULLISH_MODERATE ||
+            bias == BIAS_BULLISH_STRONG || bias == BIAS_BULLISH_VERY_STRONG);
+}
+bool IsConsideredBearishLeaning(ENUM_BIAS_STATUS bias) {
+    return (bias == BIAS_BEARISH_WEAK || bias == BIAS_BEARISH_MODERATE ||
+            bias == BIAS_BEARISH_STRONG || bias == BIAS_BEARISH_VERY_STRONG);
+}
+
+//+------------------------------------------------------------------+
+//| Main function to get updated bias status                         |
+//+------------------------------------------------------------------+
+ENUM_BIAS_STATUS GetUpdatedDailyBiasSignal()
+{
+    if(!g_enable_bias_logic) return BIAS_NEUTRAL;
+
+    // 1. Calculate Base Multi-Timeframe EMA Bias and update global scores
+    ENUM_BIAS_STATUS calculated_multi_tf_ema_bias = CalculateMultiTimeframeEmaBias();
+    // Global scores (g_multi_tf_bullish_score, etc.) are updated inside CalculateMultiTimeframeEmaBias()
+
+    // 2. Get Intraday Warning Signals
+    ENUM_BIAS_STATUS rsi_m15_warning = CheckM15RsiWarning(); // Assumes CheckM15RsiWarning is implemented
+
+    // 3. Prepare M5 Context Values
+    M5SignalContext m5_ctx;
+    if(!PrepareM5SignalValues(m5_ctx)) { // Assumes PrepareM5SignalValues is implemented
+        // Print("GetUpdatedDailyBiasSignal: Failed to prepare M5 values. Using Multi-TF EMA Bias only.");
+        return calculated_multi_tf_ema_bias;
+    }
+
+    // 4. Analyze Intraday M5 Reversal Signals
+    SwingPoint m5_swings[];
+    if(InpM5UseZigZagForSwings) {
+        FindSwingPoints_ZigZag(PERIOD_M5, m5_swings, InpM5ZigZagDepth, InpM5ZigZagDeviation, InpM5ZigZagBackstep, InpM5SwingLookback);
+    } else {
+        FindSwingPoints(PERIOD_M5, m5_swings, InpM5SwingDepth, InpM5SwingLookback);
+    }
+    ENUM_BIAS_STATUS m5_reversal = DetectM5ReversalSignal(m5_ctx, m5_swings); // Assumes DetectM5ReversalSignal is implemented
+
+    // 5. Analyze Intraday M5 Continuation Signals
+    ENUM_BIAS_STATUS m5_continuation = BIAS_NEUTRAL;
+    if(m5_reversal == BIAS_NEUTRAL) {
+        m5_continuation = DetectM5ContinuationSignal(m5_ctx, rsi_m15_warning); // Assumes DetectM5ContinuationSignal is implemented
+    }
+
+    // --- 6. Final Bias Determination with Priority ---
+    ENUM_BIAS_STATUS final_bias = calculated_multi_tf_ema_bias; // Start with the Multi-TF EMA bias
+
+    if(m5_reversal != BIAS_NEUTRAL) {
+        final_bias = m5_reversal;
+    }
+    else if(rsi_m15_warning == SIGNAL_OVB_M15 &&
+       (calculated_multi_tf_ema_bias == BIAS_BULLISH_VERY_STRONG || calculated_multi_tf_ema_bias == BIAS_BULLISH_STRONG || calculated_multi_tf_ema_bias == BIAS_BULLISH_MODERATE)) {
+        final_bias = SIGNAL_OVB_M15;
+    }
+    else if(rsi_m15_warning == SIGNAL_OVS_M15 &&
+       (calculated_multi_tf_ema_bias == BIAS_BEARISH_VERY_STRONG || calculated_multi_tf_ema_bias == BIAS_BEARISH_STRONG || calculated_multi_tf_ema_bias == BIAS_BEARISH_MODERATE)) {
+        final_bias = SIGNAL_OVS_M15;
+    }
+    else if(m5_continuation != BIAS_NEUTRAL) {
+        bool multiTfSupportsContinuation = false;
+        if(m5_continuation == SIGNAL_CONTINUATION_BULLISH_M5 &&
+           ( IsConsideredBullishLeaning(calculated_multi_tf_ema_bias) ||
+             calculated_multi_tf_ema_bias == BIAS_NEUTRAL ||
+             calculated_multi_tf_ema_bias == BIAS_RANGING_CONFIRMED ||
+             (IsConsideredBearishLeaning(calculated_multi_tf_ema_bias) && rsi_m15_warning == SIGNAL_OVS_M15) )
+          ) {
+           multiTfSupportsContinuation = true;
+        }
+        else if(m5_continuation == SIGNAL_CONTINUATION_BEARISH_M5 &&
+                ( IsConsideredBearishLeaning(calculated_multi_tf_ema_bias) ||
+                  calculated_multi_tf_ema_bias == BIAS_NEUTRAL ||
+                  calculated_multi_tf_ema_bias == BIAS_RANGING_CONFIRMED ||
+                  (IsConsideredBullishLeaning(calculated_multi_tf_ema_bias) && rsi_m15_warning == SIGNAL_OVB_M15) )
+               ) {
+           multiTfSupportsContinuation = true;
+        }
+
+        if(multiTfSupportsContinuation) {
+            final_bias = m5_continuation;
+        }
+        // If M5 Continuation strongly conflicts with a strong Multi-TF EMA Bias, prioritize the Multi-TF Bias.
+        else if ( ((calculated_multi_tf_ema_bias == BIAS_BULLISH_STRONG || calculated_multi_tf_ema_bias == BIAS_BULLISH_VERY_STRONG) && m5_continuation == SIGNAL_CONTINUATION_BEARISH_M5) ||
+                  ((calculated_multi_tf_ema_bias == BIAS_BEARISH_STRONG || calculated_multi_tf_ema_bias == BIAS_BEARISH_VERY_STRONG) && m5_continuation == SIGNAL_CONTINUATION_BULLISH_M5) )
+        {
+             final_bias = calculated_multi_tf_ema_bias; // Multi-TF EMA Bias overrides
+        }
+        // If M5 Continuation conflicts with a non-strong, non-neutral/ranging Multi-TF bias, maybe neutral is safer
+        else if ( ( IsConsideredBullishLeaning(calculated_multi_tf_ema_bias) && m5_continuation == SIGNAL_CONTINUATION_BEARISH_M5 && calculated_multi_tf_ema_bias != BIAS_NEUTRAL && calculated_multi_tf_ema_bias != BIAS_RANGING_CONFIRMED ) ||
+                  ( IsConsideredBearishLeaning(calculated_multi_tf_ema_bias) && m5_continuation == SIGNAL_CONTINUATION_BULLISH_M5 && calculated_multi_tf_ema_bias != BIAS_NEUTRAL && calculated_multi_tf_ema_bias != BIAS_RANGING_CONFIRMED ) )
+        {
+            // PrintFormat("GetBias: M5 Cont (%s) conflicts with moderate MultiTF (%s). Setting Neutral.", EnumToString(m5_continuation), EnumToString(calculated_multi_tf_ema_bias));
+            // final_bias = BIAS_NEUTRAL; // Optional: More conservative
+        }
+    }
+    // PrintFormat("GetUpdatedDailyBiasSignal - Final Determined Bias: %s", EnumToString(final_bias));
+    return final_bias;
+}
